@@ -8,15 +8,16 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Rnd } from 'react-rnd';
 import Hls from 'hls.js';
 
-function HlsPlayer({ url }: { url: string }) {
+function HlsPlayer({ url, cacheBust }: { url: string; cacheBust?: number }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     if (!videoRef.current) return;
     
     // If it's a direct MP4 video, use native video src
-    if (url.toLowerCase().endsWith('.mp4')) {
-      videoRef.current.src = url;
+    if (url.toLowerCase().includes('.mp4')) {
+      const sep = url.includes('?') ? '&' : '?';
+      videoRef.current.src = cacheBust ? `${url}${sep}_t=${cacheBust}` : url;
       videoRef.current.play().catch(e => console.log('Autoplay prevented', e));
       return;
     }
@@ -50,6 +51,7 @@ function HlsPlayer({ url }: { url: string }) {
       muted
       autoPlay
       playsInline
+      loop
     />
   );
 }
@@ -214,129 +216,159 @@ function App() {
         style={{ background: 'radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.7) 100%)' }} />
 
       {/* ── ARGUS HUD — TOP RIGHT ── */}
-      <div style={{ position: 'absolute', top: 32, right: 32, zIndex: 30, width: 300 }} className="pointer-events-auto">
-        <div className="bg-[#0a0f14]/85 backdrop-blur-3xl rounded-2xl border border-white/5 p-6 shadow-2xl">
-          {/* Logo */}
-          <div className="flex flex-col mb-6 pb-4 border-b border-white/5">
-            <h1 className="text-3xl font-extrabold tracking-tight text-white leading-none">Argus</h1>
-            <p className="text-xs text-gray-400 font-medium tracking-wide mt-2">Global Surveillance</p>
+      <div style={{ position: 'absolute', top: 32, right: 32, zIndex: 30, width: 340 }} className="pointer-events-auto">
+        <div className="bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-8 shadow-2xl relative overflow-hidden">
+          {/* Decorative Corner */}
+          <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-bl from-white/10 to-transparent pointer-events-none" />
+          
+          {/* Logo Section */}
+          <div className="mb-8">
+            <h1 className="text-4xl font-extrabold tracking-tighter text-white">ARGUS</h1>
+            <div className="flex items-center gap-2 mt-2">
+              <Scan className="w-4 h-4 text-[#00e5ff]" />
+              <p className="text-xs text-[#00e5ff] font-mono tracking-widest uppercase">Global Network</p>
+            </div>
           </div>
 
-          {/* Stats */}
-          <div className="flex gap-3 mb-6">
-            <div className="flex-1 bg-white/5 rounded-xl p-4 text-center">
-              <p className="text-white font-mono text-xl font-semibold">
+          {/* Stats Grid */}
+          <div className="grid grid-cols-2 gap-4 mb-8">
+            <div className="bg-[#0A1015] rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
+              <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <p className="text-gray-500 text-[10px] uppercase tracking-widest font-semibold mb-2">Total Nodes</p>
+              <p className="text-white font-mono text-2xl font-semibold">
                 {loading ? '—' : cameras.length.toLocaleString()}
               </p>
-              <p className="text-gray-500 text-[10px] uppercase tracking-wider font-semibold mt-1">Nodes</p>
             </div>
-            <div className="flex-1 bg-white/5 rounded-xl p-4 text-center">
-              <p className="text-white font-mono text-lg font-semibold flex items-center justify-center gap-1.5">
-                <Activity className="w-4 h-4 text-[#00ff88]" /> Live
+            <div className="bg-[#0A1015] rounded-2xl p-5 border border-[#00ff88]/20 relative overflow-hidden group">
+              <div className="absolute inset-0 bg-gradient-to-br from-[#00ff88]/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+              <p className="text-[#00ff88]/70 text-[10px] uppercase tracking-widest font-semibold mb-2">System Status</p>
+              <p className="text-[#00ff88] font-mono text-lg font-semibold flex items-center gap-2">
+                <Activity className="w-4 h-4 animate-pulse" /> Active
               </p>
-              <p className="text-gray-500 text-[10px] uppercase tracking-wider font-semibold mt-1">Status</p>
             </div>
           </div>
 
-          {/* Legend */}
-          <div className="flex flex-col gap-3">
-            {[
-              { type: 'live',  color: '#00ff88', label: 'Live Video Feed' },
-              { type: 'still', color: '#00e5ff', label: 'Static Snapshot' },
-            ].map(({ type, color, label }) => (
-              <div key={label} className="flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-2 h-2 rounded-full" style={{ backgroundColor: color, boxShadow: `0 0 10px ${color}` }} />
-                  <span className="text-xs font-medium text-gray-300">
-                    {label}
-                  </span>
-                </div>
-                <span className="text-xs font-mono font-medium text-gray-400">
-                  {type === 'live' ? counts.live.toLocaleString() : counts.still.toLocaleString()}
-                </span>
+          {/* Legend Details */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
+              <div className="flex items-center gap-3">
+                <div className="w-2.5 h-2.5 rounded-full bg-[#00ff88] shadow-[0_0_12px_#00ff88]" />
+                <span className="text-sm font-medium text-gray-200">Live Video</span>
               </div>
-            ))}
+              <span className="text-sm font-mono font-semibold text-white">
+                {counts.live.toLocaleString()}
+              </span>
+            </div>
+            <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
+              <div className="flex items-center gap-3">
+                <div className="w-2.5 h-2.5 rounded-full bg-[#00e5ff] shadow-[0_0_12px_#00e5ff]" />
+                <span className="text-sm font-medium text-gray-200">Static Feed</span>
+              </div>
+              <span className="text-sm font-mono font-semibold text-white">
+                {counts.still.toLocaleString()}
+              </span>
+            </div>
           </div>
         </div>
       </div>
 
       {/* ── Hover Tooltip ── */}
-      {hovered && (
-        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 pointer-events-none">
-          <div className="bg-[#0a0f14]/90 backdrop-blur-2xl rounded-full border border-white/10 px-6 py-2.5 shadow-xl max-w-lg flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-[#00e5ff]" />
-            <p className="text-white text-sm font-semibold tracking-tight truncate">{hovered.properties.name}</p>
-            <div className="w-px h-3 bg-white/20 mx-1" />
-            <p className="text-gray-400 text-xs font-mono">{formatLocation(hovered)}</p>
-          </div>
-        </div>
-      )}
+      <AnimatePresence>
+        {hovered && (
+          <motion.div 
+            initial={{ opacity: 0, y: 10, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 5, scale: 0.95 }}
+            transition={{ duration: 0.15 }}
+            className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 pointer-events-none"
+          >
+            <div className="bg-[#05090C]/90 backdrop-blur-xl rounded-2xl border border-white/10 p-4 shadow-2xl flex items-center gap-4 min-w-[300px]">
+              <div className="flex-shrink-0 w-10 h-10 rounded-full bg-white/5 flex items-center justify-center border border-white/10">
+                <Scan className="w-5 h-5 text-[#00e5ff]" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-white text-sm font-bold tracking-tight truncate mb-1">
+                  {hovered.properties.name}
+                </p>
+                <div className="flex items-center gap-2">
+                  <div className={`w-1.5 h-1.5 rounded-full ${hovered.properties.streamUrl ? 'bg-[#00ff88]' : 'bg-[#00e5ff]'}`} />
+                  <p className="text-gray-400 text-xs font-mono truncate">
+                    {formatLocation(hovered)}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* ── Camera Feed Panel — DRAGGABLE RND ── */}
       {selectedCamera ? (
         <Rnd
-          default={{ x: 32, y: 32, width: 360, height: 500 }}
-          minWidth={280}
-          minHeight={350}
+          default={{ x: 40, y: 40, width: 400, height: 560 }}
+          minWidth={320}
+          minHeight={400}
           bounds="window"
           dragHandleClassName="drag-handle"
           className="z-40"
         >
-          <div className="bg-[#0a0f14]/90 backdrop-blur-3xl rounded-2xl border border-white/10 p-6 flex flex-col h-full shadow-2xl w-full">
-            {/* Elegant Header (Drag Handle) */}
-            <div className="drag-handle cursor-move flex justify-between items-start mb-4 pb-4 border-b border-white/5">
+          {/* Main Container - Strict Flex Column */}
+          <div className="bg-[#05090C]/95 backdrop-blur-3xl rounded-3xl border border-white/10 flex flex-col h-full shadow-[0_0_50px_rgba(0,0,0,0.8)] overflow-hidden">
+            
+            {/* 1. Header Area (Fixed height) */}
+            <div className="drag-handle cursor-move flex items-center justify-between p-6 bg-white/5 border-b border-white/10 flex-shrink-0">
               <div className="flex-1 min-w-0 pr-4">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-[10px] font-bold tracking-widest uppercase text-gray-400">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-[10px] font-bold tracking-widest uppercase text-gray-500">
                     {selectedCamera.properties.source ?? selectedCamera.properties.type}
                   </span>
                   {hasStream && (
-                    <span className="text-[#00ff88] text-[9px] font-bold tracking-widest bg-[#00ff88]/10 px-1.5 py-0.5 rounded flex items-center">
+                    <span className="text-[#00ff88] text-[9px] font-bold tracking-widest bg-[#00ff88]/10 px-1.5 py-0.5 rounded flex items-center border border-[#00ff88]/20">
                       <Video className="w-3 h-3 mr-1" /> LIVE
                     </span>
                   )}
                 </div>
-                <h2 className="text-white text-lg font-semibold tracking-tight leading-snug truncate">
+                <h2 className="text-white text-lg font-bold tracking-tight truncate">
                   {selectedCamera.properties.name}
                 </h2>
-                <div className="flex items-center gap-1.5 mt-1.5">
-                  <MapPin className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
+                <div className="flex items-center gap-1.5 mt-1">
+                  <MapPin className="w-3.5 h-3.5 text-[#00e5ff]" />
                   <p className="text-gray-400 text-xs truncate">{formatLocation(selectedCamera)}</p>
                 </div>
               </div>
-              <button onClick={() => setSelectedCamera(null)}
-                className="text-[#00e5ff]/40 hover:text-[#00e5ff] transition-colors p-2 rounded-full flex-shrink-0">
-                <X className="w-5 h-5" />
-              </button>
+              
+              {/* Controls */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {!hasStream && feedWorks && (
+                  <button onClick={manualRefresh} title="Refresh Feed"
+                    className="w-10 h-10 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 flex items-center justify-center text-white transition-all group outline-none">
+                    <RefreshCw className="w-4 h-4 group-hover:rotate-180 transition-transform duration-500" />
+                  </button>
+                )}
+                <button onClick={() => setSelectedCamera(null)} title="Close"
+                  className="w-10 h-10 rounded-full bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 flex items-center justify-center text-red-400 hover:text-red-300 transition-all outline-none">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
-            {/* Feed area */}
-            <div className="flex-1 relative bg-black/50 rounded-xl overflow-hidden border border-white/5 min-h-0">
+            {/* 2. Media Area (Flex Grow) */}
+            <div className="flex-1 relative bg-black flex flex-col min-h-0 border-b border-white/10">
               {feedWorks ? (
                 <>
-                  {hasStream && (
-                    <div className="absolute bottom-3 left-3 z-10 bg-black/60 backdrop-blur-md rounded-md px-3 py-1.5 flex items-center gap-2 border border-[#00ff88]/20 shadow-lg">
-                      <div className="w-2 h-2 rounded-full bg-[#00ff88] animate-pulse" />
-                      <span className="text-[#00ff88] text-[10px] font-bold tracking-widest">LIVE STREAM</span>
-                    </div>
-                  )}
                   {!hasStream && (
-                    <div className="absolute bottom-3 left-3 z-10 bg-black/60 backdrop-blur-md rounded-md px-3 py-1.5 flex items-center gap-2 border border-[#00e5ff]/20 shadow-lg">
-                      <div className="w-2 h-2 rounded-full bg-[#00e5ff]" />
-                      <span className="text-[#00e5ff] text-[10px] font-bold tracking-widest">STATIC IMAGE</span>
+                    <div className="absolute bottom-4 left-4 z-10 bg-black/80 backdrop-blur-md rounded-lg px-3 py-1.5 flex items-center gap-2 border border-[#00e5ff]/30">
+                      <div className="w-2 h-2 rounded-full bg-[#00e5ff] shadow-[0_0_8px_#00e5ff]" />
+                      <span className="text-[#00e5ff] text-[10px] font-bold tracking-widest">STATIC</span>
                     </div>
                   )}
                   {hasStream ? (
-                    <HlsPlayer url={selectedCamera.properties.streamUrl!} />
+                    <HlsPlayer url={selectedCamera.properties.streamUrl!} cacheBust={imgCacheBust} />
                   ) : (
                     <>
-                      <button onClick={manualRefresh}
-                        className="absolute top-3 right-3 z-10 bg-transparent p-2 text-[#00e5ff]/50 hover:text-[#00e5ff] hover:bg-[#00e5ff]/10 rounded-full transition-all group shadow-none border-none">
-                        <RefreshCw className="w-5 h-5 group-hover:rotate-180 transition-transform duration-500" />
-                      </button>
                       {!imgLoaded && (
-                        <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="w-6 h-6 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm z-10">
+                          <div className="w-8 h-8 border-2 border-white/10 border-t-[#00e5ff] rounded-full animate-spin" />
                         </div>
                       )}
                       <img
@@ -356,48 +388,57 @@ function App() {
                       />
                     </>
                   )}
-                  <div className="hidden absolute inset-0 flex-col items-center justify-center text-center p-4">
-                    <Eye className="w-8 h-8 text-gray-600 mb-2" />
-                    <p className="text-gray-500 text-sm font-medium">Camera offline</p>
+                  <div className="hidden absolute inset-0 flex-col items-center justify-center text-center p-6 bg-[#05090C]">
+                    <div className="w-16 h-16 rounded-full bg-red-500/10 flex items-center justify-center mb-4">
+                      <Eye className="w-8 h-8 text-red-500" />
+                    </div>
+                    <p className="text-white text-base font-bold mb-1">Feed Offline</p>
+                    <p className="text-gray-500 text-xs">Connection to the camera was lost.</p>
                   </div>
                 </>
               ) : (
-                <div className="w-full h-full flex flex-col items-center justify-center text-center p-6">
-                  <Eye className="w-8 h-8 text-gray-700 mb-3" />
-                  <p className="text-gray-300 text-sm font-medium mb-1">Feed Unavailable</p>
-                  <p className="text-gray-500 text-xs leading-relaxed">
-                    This host blocks external embedding.
-                    Try another node.
+                <div className="w-full h-full flex flex-col items-center justify-center text-center p-8 bg-[#05090C]">
+                  <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-4 border border-white/10">
+                    <Eye className="w-8 h-8 text-gray-500" />
+                  </div>
+                  <p className="text-white text-base font-bold mb-2">Feed Unavailable</p>
+                  <p className="text-gray-500 text-xs max-w-[250px] leading-relaxed">
+                    This camera host prevents external embedding or the feed requires authentication.
                   </p>
                 </div>
               )}
             </div>
 
-            {/* Footer meta */}
-            <div className="mt-6 pt-6 border-t border-white/5 space-y-3">
-              {(selectedCamera.properties.route || selectedCamera.properties.highway) && (
-                <div className="flex justify-between items-center">
-                  <span className="text-gray-500 text-xs">Route</span>
-                  <span className="text-gray-300 text-xs font-medium">
-                    {selectedCamera.properties.route || `HWY ${selectedCamera.properties.highway}`}
+            {/* 3. Footer Area (Fixed height) */}
+            <div className="p-6 bg-[#05090C] flex-shrink-0">
+              <div className="grid grid-cols-1 gap-4">
+                {(selectedCamera.properties.route || selectedCamera.properties.highway) && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500 text-xs font-semibold tracking-wide uppercase">Route</span>
+                    <span className="text-white text-sm font-medium truncate ml-4">
+                      {selectedCamera.properties.route || `HWY ${selectedCamera.properties.highway}`}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500 text-xs font-semibold tracking-wide uppercase">Location</span>
+                  <span className="text-gray-300 text-sm font-mono truncate ml-4">
+                    {selectedCamera.geometry.coordinates[1].toFixed(4)}, {selectedCamera.geometry.coordinates[0].toFixed(4)}
                   </span>
                 </div>
-              )}
-              <div className="flex justify-between items-center">
-                <span className="text-gray-500 text-xs">Coordinates</span>
-                <span className="text-gray-400 text-xs font-mono">
-                  {selectedCamera.geometry.coordinates[1].toFixed(4)}, {selectedCamera.geometry.coordinates[0].toFixed(4)}
-                </span>
+                {feedWorks && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500 text-xs font-semibold tracking-wide uppercase flex items-center gap-1.5">
+                      <Clock className="w-4 h-4" /> Last Sync
+                    </span>
+                    <span className="text-[#00e5ff] text-sm font-mono truncate ml-4">
+                      {lastRefresh.toLocaleTimeString()}
+                    </span>
+                  </div>
+                )}
               </div>
-              {feedWorks && (
-                <div className="flex justify-between items-center">
-                  <span className="text-gray-500 text-xs flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5" /> Refreshed
-                  </span>
-                  <span className="text-gray-400 text-xs font-mono">{lastRefresh.toLocaleTimeString()}</span>
-                </div>
-              )}
             </div>
+            
           </div>
         </Rnd>
       ) : null}
