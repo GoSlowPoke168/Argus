@@ -1,4 +1,8 @@
 .env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
 
 # Logs
 logs
@@ -13,12 +17,19 @@ node_modules
 dist
 dist-ssr
 *.local
+.eslintcache
+coverage/
+
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
 .DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
 *.suo
 *.ntvs*
 *.njsproj
