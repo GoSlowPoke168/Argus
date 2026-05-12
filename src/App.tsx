@@ -3,7 +3,7 @@ import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer } from '@deck.gl/layers';
 import Map from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video } from 'lucide-react';
+import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Rnd } from 'react-rnd';
 import Hls from 'hls.js';
@@ -43,6 +43,13 @@ function HlsPlayer({ url, cacheBust }: { url: string; cacheBust?: number }) {
     };
   }, [url]);
 
+  useEffect(() => {
+    if (!videoRef.current || !url.toLowerCase().includes('.mp4')) return;
+    const sep = url.includes('?') ? '&' : '?';
+    videoRef.current.src = cacheBust ? `${url}${sep}_t=${cacheBust}` : url;
+    videoRef.current.play().catch(e => console.log('Autoplay prevented', e));
+  }, [cacheBust]);
+
   return (
     <video
       ref={videoRef}
@@ -61,7 +68,8 @@ const INITIAL_VIEW_STATE = {
   latitude: 25,
   zoom: 2,
   pitch: 30,
-  bearing: 0
+  bearing: 0,
+  minZoom: 1.5
 };
 
 interface CameraProperties {
@@ -135,6 +143,9 @@ function App() {
   const [imgCacheBust, setImgCacheBust] = useState(Date.now());
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [imgLoaded, setImgLoaded] = useState(false);
+  const [isHudMinimized, setIsHudMinimized] = useState(false);
+  const [mouseCoords, setMouseCoords] = useState<[number, number] | null>(null);
+  const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -157,15 +168,58 @@ function App() {
   useEffect(() => {
     setImgLoaded(false);
     setImgCacheBust(Date.now());
+    setLiveWindyUrl(null);
+
+    if (selectedCamera?.properties.source === 'windy') {
+      const camId = selectedCamera.properties.id.replace('windy_', '');
+      const apiKey = import.meta.env.VITE_WINDY_API_KEY;
+      
+      if (apiKey) {
+        fetch(`https://api.windy.com/webcams/api/v3/webcams/${camId}?include=images`, {
+          headers: { 'x-windy-api-key': apiKey }
+        })
+          .then(r => r.json())
+          .then(data => {
+            const images = data.images || {};
+            const liveUrl = (images.current && images.current.preview) || (images.daylight && images.daylight.preview);
+            if (liveUrl) setLiveWindyUrl(liveUrl);
+          })
+          .catch(e => console.error("Failed to fetch live windy token:", e));
+      }
+    }
   }, [selectedCamera?.properties.id]);
 
   const manualRefresh = () => {
     setImgCacheBust(Date.now());
     setLastRefresh(new Date());
     setImgLoaded(false);
+    
+    // If it's a windy camera, force a re-fetch of the token
+    if (selectedCamera?.properties.source === 'windy') {
+      const camId = selectedCamera.properties.id.replace('windy_', '');
+      const apiKey = import.meta.env.VITE_WINDY_API_KEY;
+      if (apiKey) {
+        fetch(`https://api.windy.com/webcams/api/v3/webcams/${camId}?include=images`, {
+          headers: { 'x-windy-api-key': apiKey }
+        })
+          .then(r => r.json())
+          .then(data => {
+            const images = data.images || {};
+            const liveUrl = (images.current && images.current.preview) || (images.daylight && images.daylight.preview);
+            if (liveUrl) setLiveWindyUrl(liveUrl);
+          })
+          .catch(e => console.error("Failed to fetch live windy token:", e));
+      }
+    }
   };
 
   const getLiveUrl = (url: string) => {
+    if (selectedCamera?.properties.source === 'windy') {
+      // If we have a fresh token URL, use it
+      if (liveWindyUrl) return liveWindyUrl;
+      // Otherwise fallback to the one in geojson until fetch completes
+    }
+    
     if (!url) return '';
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}_t=${imgCacheBust}`;
@@ -184,7 +238,23 @@ function App() {
       onClick: ({ object }) => object && setSelectedCamera(object),
       onHover: ({ object }) => setHovered(object ?? null),
       updateTriggers: { getFillColor: cameras }
-    })
+    }),
+    ...(selectedCamera ? [
+      new ScatterplotLayer<CameraFeature>({
+        id: 'camera-highlight',
+        data: [selectedCamera],
+        getPosition: d => d.geometry.coordinates,
+        getFillColor: [255, 60, 60, 0], // transparent fill
+        getLineColor: [255, 60, 60, 255], // red border
+        lineWidthMinPixels: 2,
+        getRadius: 15000,
+        radiusMinPixels: 15,
+        radiusMaxPixels: 25,
+        stroked: true,
+        filled: true,
+        updateTriggers: { getPosition: selectedCamera }
+      })
+    ] : [])
   ];
 
   const counts = cameras.reduce((acc, c) => {
@@ -200,13 +270,18 @@ function App() {
   const hasStream = !!(selectedCamera?.properties.streamUrl);
 
   return (
-    <div className="w-full h-screen relative bg-[#0a0a0f] overflow-hidden font-sans">
+    <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
       {/* Map */}
       <DeckGL
         initialViewState={INITIAL_VIEW_STATE}
         controller={true}
         layers={layers}
         getCursor={({ isDragging }) => isDragging ? 'grabbing' : hovered ? 'crosshair' : 'grab'}
+        onHover={(info) => {
+          if (info.coordinate) setMouseCoords(info.coordinate as [number, number]);
+          else setMouseCoords(null);
+        }}
+        onMouseLeave={() => setMouseCoords(null)}
       >
         <Map mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" />
       </DeckGL>
@@ -215,61 +290,92 @@ function App() {
       <div className="absolute inset-0 pointer-events-none"
         style={{ background: 'radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.7) 100%)' }} />
 
-      {/* ── ARGUS HUD — TOP RIGHT ── */}
-      <div style={{ position: 'absolute', top: 32, right: 32, zIndex: 30, width: 340 }} className="pointer-events-auto">
-        <div className="bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-8 shadow-2xl relative overflow-hidden">
-          {/* Decorative Corner */}
-          <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-bl from-white/10 to-transparent pointer-events-none" />
-          
-          {/* Logo Section */}
-          <div className="mb-8">
-            <h1 className="text-4xl font-extrabold tracking-tighter text-white">ARGUS</h1>
-            <div className="flex items-center gap-2 mt-2">
-              <Scan className="w-4 h-4 text-[#00e5ff]" />
-              <p className="text-xs text-[#00e5ff] font-mono tracking-widest uppercase">Global Network</p>
-            </div>
-          </div>
-
-          {/* Stats Grid */}
-          <div className="grid grid-cols-2 gap-4 mb-8">
-            <div className="bg-[#0A1015] rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
-              <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-              <p className="text-gray-500 text-[10px] uppercase tracking-widest font-semibold mb-2">Total Nodes</p>
-              <p className="text-white font-mono text-2xl font-semibold">
-                {loading ? '—' : cameras.length.toLocaleString()}
-              </p>
-            </div>
-            <div className="bg-[#0A1015] rounded-2xl p-5 border border-[#00ff88]/20 relative overflow-hidden group">
-              <div className="absolute inset-0 bg-gradient-to-br from-[#00ff88]/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
-              <p className="text-[#00ff88]/70 text-[10px] uppercase tracking-widest font-semibold mb-2">System Status</p>
-              <p className="text-[#00ff88] font-mono text-lg font-semibold flex items-center gap-2">
-                <Activity className="w-4 h-4 animate-pulse" /> Active
-              </p>
-            </div>
-          </div>
-
-          {/* Legend Details */}
-          <div className="space-y-4">
-            <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
-              <div className="flex items-center gap-3">
-                <div className="w-2.5 h-2.5 rounded-full bg-[#00ff88] shadow-[0_0_12px_#00ff88]" />
-                <span className="text-sm font-medium text-gray-200">Live Video</span>
-              </div>
-              <span className="text-sm font-mono font-semibold text-white">
-                {counts.live.toLocaleString()}
-              </span>
-            </div>
-            <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
-              <div className="flex items-center gap-3">
-                <div className="w-2.5 h-2.5 rounded-full bg-[#00e5ff] shadow-[0_0_12px_#00e5ff]" />
-                <span className="text-sm font-medium text-gray-200">Static Feed</span>
-              </div>
-              <span className="text-sm font-mono font-semibold text-white">
-                {counts.still.toLocaleString()}
-              </span>
-            </div>
+      {/* ── MOUSE COORDINATES ── */}
+      {mouseCoords && (
+        <div className="absolute bottom-8 left-8 z-30 pointer-events-none">
+          <div className="bg-[#05090C]/70 backdrop-blur-xl rounded-xl border border-white/10 px-6 py-4 flex items-center gap-4 shadow-2xl">
+            <Scan className="w-5 h-5 text-[#00e5ff]" />
+            <span className="text-[#00e5ff] text-base font-mono tracking-widest font-semibold">
+              {mouseCoords[1].toFixed(4)}, {mouseCoords[0].toFixed(4)}
+            </span>
           </div>
         </div>
+      )}
+
+      {/* ── ARGUS HUD — TOP RIGHT ── */}
+      <div style={{ position: 'absolute', top: 32, right: 32, zIndex: 30, width: 340 }} className="pointer-events-auto">
+        <motion.div 
+          animate={{ height: isHudMinimized ? 120 : 'auto' }}
+          className="bg-[#05090C]/70 backdrop-blur-2xl rounded-3xl border border-white/10 p-8 shadow-2xl relative overflow-hidden"
+        >
+          {/* Logo Section */}
+          <div className="mb-6 flex items-start justify-between">
+            <div>
+              <h1 className="text-4xl font-extrabold tracking-tighter text-white">ARGUS</h1>
+              <div className="flex items-center gap-2 mt-2">
+                <Scan className="w-4 h-4 text-[#00e5ff]" />
+                <p className="text-xs text-[#00e5ff] font-mono tracking-widest uppercase">Global Network</p>
+              </div>
+            </div>
+            <button 
+              onClick={() => setIsHudMinimized(!isHudMinimized)}
+              className="p-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-gray-400 hover:text-white transition-all outline-none"
+            >
+              {isHudMinimized ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
+            </button>
+          </div>
+
+          <AnimatePresence>
+            {!isHudMinimized && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                {/* Stats Grid */}
+                <div className="grid grid-cols-2 gap-4 mb-8">
+                  <div className="bg-[#0A1015]/40 rounded-2xl p-5 border border-white/5 relative overflow-hidden group">
+                    <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <p className="text-gray-500 text-[10px] uppercase tracking-widest font-semibold mb-2">Total Nodes</p>
+                    <p className="text-white font-mono text-2xl font-semibold">
+                      {loading ? '—' : cameras.length.toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="bg-[#0A1015]/40 rounded-2xl p-5 border border-[#00ff88]/20 relative overflow-hidden group">
+                    <div className="absolute inset-0 bg-gradient-to-br from-[#00ff88]/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+                    <p className="text-[#00ff88]/70 text-[10px] uppercase tracking-widest font-semibold mb-2">System Status</p>
+                    <p className="text-[#00ff88] font-mono text-lg font-semibold flex items-center gap-2">
+                      <Activity className="w-4 h-4 animate-pulse" /> Active
+                    </p>
+                  </div>
+                </div>
+
+                {/* Legend Details */}
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
+                    <div className="flex items-center gap-3">
+                      <div className="w-2.5 h-2.5 rounded-full bg-[#00ff88] shadow-[0_0_12px_#00ff88]" />
+                      <span className="text-sm font-medium text-gray-200">Live Video</span>
+                    </div>
+                    <span className="text-sm font-mono font-semibold text-white">
+                      {counts.live.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5">
+                    <div className="flex items-center gap-3">
+                      <div className="w-2.5 h-2.5 rounded-full bg-[#00e5ff] shadow-[0_0_12px_#00e5ff]" />
+                      <span className="text-sm font-medium text-gray-200">Static Feed</span>
+                    </div>
+                    <span className="text-sm font-mono font-semibold text-white">
+                      {counts.still.toLocaleString()}
+                    </span>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </motion.div>
       </div>
 
       {/* ── Hover Tooltip ── */}
@@ -313,15 +419,21 @@ function App() {
           className="z-40"
         >
           {/* Main Container - Strict Flex Column */}
-          <div className="bg-[#05090C]/95 backdrop-blur-3xl rounded-3xl border border-white/10 flex flex-col h-full shadow-[0_0_50px_rgba(0,0,0,0.8)] overflow-hidden">
+          <div className="bg-[#05090C]/75 backdrop-blur-3xl rounded-3xl border border-white/10 flex flex-col h-full shadow-[0_0_50px_rgba(0,0,0,0.8)] overflow-hidden">
             
             {/* 1. Header Area (Fixed height) */}
             <div className="drag-handle cursor-move flex items-center justify-between p-6 bg-white/5 border-b border-white/10 flex-shrink-0">
               <div className="flex-1 min-w-0 pr-4">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-[10px] font-bold tracking-widest uppercase text-gray-500">
-                    {selectedCamera.properties.source ?? selectedCamera.properties.type}
-                  </span>
+                  {selectedCamera.properties.source === 'windy' ? (
+                    <span className="text-[10px] font-semibold tracking-wide text-gray-500">
+                      Webcams provided by <a href="https://www.windy.com/" target="_blank" rel="noopener noreferrer" className="text-[#00e5ff] hover:underline hover:text-white transition-colors">windy.com</a> &mdash; <a href="https://www.windy.com/webcams/add" target="_blank" rel="noopener noreferrer" className="text-[#00e5ff] hover:underline hover:text-white transition-colors">add a webcam</a>
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-bold tracking-widest uppercase text-gray-500">
+                      {selectedCamera.properties.source ?? selectedCamera.properties.type}
+                    </span>
+                  )}
                   {hasStream && (
                     <span className="text-[#00ff88] text-[9px] font-bold tracking-widest bg-[#00ff88]/10 px-1.5 py-0.5 rounded flex items-center border border-[#00ff88]/20">
                       <Video className="w-3 h-3 mr-1" /> LIVE
@@ -431,9 +543,14 @@ function App() {
                     <span className="text-gray-500 text-xs font-semibold tracking-wide uppercase flex items-center gap-1.5">
                       <Clock className="w-4 h-4" /> Last Sync
                     </span>
-                    <span className="text-[#00e5ff] text-sm font-mono truncate ml-4">
-                      {lastRefresh.toLocaleTimeString()}
-                    </span>
+                    <div className="flex flex-col items-end">
+                      <span className="text-[#00e5ff] text-sm font-mono truncate ml-4">
+                        {lastRefresh.toLocaleTimeString()}
+                      </span>
+                      {selectedCamera.properties.source === 'tfl_london' && (
+                        <span className="text-gray-500 text-[9px] mt-0.5 tracking-wider uppercase">Source updates every 5m</span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
