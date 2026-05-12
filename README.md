@@ -1,12 +1,12 @@
 # ARGUS — Global Camera Intelligence
 
-Argus is a high-performance, tactical surveillance dashboard designed to aggregate and visualize global open-data camera feeds. Featuring a "Skynet-style" interface, it provides real-time monitoring of over 80,000+ camera nodes across highways, landmarks, and urban centers worldwide.
+Argus is a high-performance, tactical surveillance dashboard designed to aggregate and visualize global open-data camera feeds. It provides real-time monitoring of over 80,000+ camera nodes across highways, landmarks, and urban centers worldwide.
 
 ![Argus Tactical UI](src/assets/DemoInterface.png)
 
 ## Core Features
 
-- **Massive Global Scale**: Ingests 80,000+ cameras around 126+ countries world in 
+- **Massive Global Scale**: Ingests 80,000+ cameras from 126+ countries around the world.
 - **Real-Time Visualization**: High-performance map rendering via Deck.GL and MapLibre.
 - **Hybrid Feed Support**: Automatically switches between live HLS video streams (.m3u8) and high-frequency static JPEGs.
 - **Intelligent Engine**: Plugin-based architecture for adding new regional data sources (Caltrans, DriveBC, LTA, Windy, etc.).
