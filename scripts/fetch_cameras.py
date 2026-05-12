@@ -9,14 +9,14 @@ SOURCES:
   1. BC DriveBC API       - ~1,040 cameras, BC Canada. FREE, no key.
   2. Windy Webcams API    - 100,000+ cameras globally, many with MJPEG video.
                            FREE key at: https://api.windy.com/  (just sign up)
-  3. 511 SF Bay Area API  - ~1,500 cameras, SF Bay Area. FREE key at: https://511.org/open-data
+
 
 HOW TO RUN:
   1. pip install requests
 
   2. Add your free API keys in the CONFIG below.
      - Windy key: https://api.windy.com  (sign up → My Profile → API Key)
-     - 511 SF key: https://511.org/open-data (sign up with email)
+
 
   3. python fetch_cameras.py
 
@@ -33,7 +33,7 @@ import time
 # ─────────────────────────────────────────────────────────
 CONFIG = {
     "WINDY_API_KEY": None,
-    "API_511_KEY": None,
+
     "TIMEOUT": 20,
     "REQUEST_DELAY": 0.5,
 }
@@ -50,7 +50,7 @@ def load_env():
 
 load_env()
 CONFIG["WINDY_API_KEY"] = os.getenv("WINDY_API_KEY")
-CONFIG["API_511_KEY"] = os.getenv("API_511_SF_KEY")
+
 
 HEADERS = {
     "User-Agent": "Argus/1.0 (Open Data Camera Aggregator; Educational Project)"
@@ -309,61 +309,7 @@ def fetch_drivebc_cameras() -> list[dict]:
     return features
 
 
-# ─────────────────────────────────────────────────────────
-# SOURCE 3: 511 SF Bay Area (Free key required)
-# https://511.org/open-data — sign up with email
-# ─────────────────────────────────────────────────────────
-def fetch_511_sf_cameras(api_key: str) -> list[dict]:
-    url = "https://api.511.org/traffic/cameras"
-    params = {"api_key": api_key, "format": "json"}
 
-    log("Fetching 511 SF Bay Area cameras...")
-    try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=CONFIG["TIMEOUT"])
-        resp.raise_for_status()
-        text = resp.content.decode("utf-8-sig")
-        raw = json.loads(text)
-    except Exception as e:
-        log(f"511 SF Bay fetch failed: {e}", "ERROR")
-        return []
-
-    cameras_list = raw if isinstance(raw, list) else raw.get("cameras", raw.get("data", []))
-    features = []
-    skipped = 0
-
-    for cam in cameras_list:
-        try:
-            lat = float(cam.get("Latitude") or cam.get("latitude") or 0)
-            lon = float(cam.get("Longitude") or cam.get("longitude") or 0)
-            if lat == 0.0 or lon == 0.0:
-                skipped += 1
-                continue
-
-            cam_id = str(cam.get("Id") or cam.get("id") or "unknown")
-            image_url = cam.get("ImageUrl") or cam.get("image_url") or cam.get("url") or ""
-            name = cam.get("Name") or cam.get("name") or cam.get("Description") or f"SF Camera {cam_id}"
-
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [lon, lat]},
-                "properties": {
-                    "id": f"511sf_{cam_id}",
-                    "name": name,
-                    "type": "traffic",
-                    "city": "San Francisco Bay Area",
-                    "country": "US",
-                    "feedUrl": image_url,
-                    "playerUrl": "",
-                    "feedType": "image/jpeg",
-                    "source": "511sf"
-                }
-            })
-        except (ValueError, TypeError):
-            skipped += 1
-            continue
-
-    log(f"511 SF Bay: {len(features)} cameras loaded ({skipped} skipped)", "OK")
-    return features
 
 
 # ─────────────────────────────────────────────────────────
@@ -466,10 +412,7 @@ def main():
     all_features.extend(fetch_singapore_cameras())
     time.sleep(CONFIG["REQUEST_DELAY"])
 
-    # Source 5: 511 SF Bay (optional free key)
-    if CONFIG["API_511_KEY"]:
-        all_features.extend(fetch_511_sf_cameras(CONFIG["API_511_KEY"]))
-        time.sleep(CONFIG["REQUEST_DELAY"])
+
 
     # Deduplicate
     before = len(all_features)
@@ -482,7 +425,7 @@ def main():
     sources_used.append("Caltrans California")
     sources_used.append("BC DriveBC")
     sources_used.append("Singapore LTA")
-    if CONFIG["API_511_KEY"]:    sources_used.append("511 SF Bay Area")
+
 
     geojson = {
         "type": "FeatureCollection",
