@@ -109,17 +109,23 @@ const WORKING_IMAGE_DOMAINS = [
   'images.data.gov.sg',  // Singapore LTA
   'imgproxy.windy.com',  // Windy Webcams
   'tripcheck.com',       // Oregon TripCheck
-  '511ia.org',           // Iowa 511
+  'skyvdn.com',          // Iowa DOT (iowadotsnapshot.us-east-1.skyvdn.com)
   'nzta.govt.nz',        // New Zealand NZTA
   'tfl.gov.uk',          // London TfL
-  'amazonaws.com',       // TfL / NZTA S3 buckets
-  'cloudfront.net',      // Iowa 511 CDN
+  'amazonaws.com',       // TfL / NZTA / Iowa DOT S3 buckets
+  'cloudfront.net',      // CDN
   'webcams.nyctmc.org',  // NYC DOT
 ];
 
 function isFeedWorking(url: string): boolean {
   if (!url) return false;
+  // Return true if domain is in the working list (not a guarantee, but a good indicator)
   return WORKING_IMAGE_DOMAINS.some(d => url.includes(d));
+}
+
+function shouldRetryWithProxy(url: string): boolean {
+  // Caltrans cameras may need retry with proxy if direct load fails
+  return url.includes('cwwp2.dot.ca.gov');
 }
 
 function getStreamColor(cam: CameraFeature): [number, number, number, number] {
@@ -211,6 +217,11 @@ function App() {
           .catch(e => console.error("Failed to fetch live windy token:", e));
       }
     }
+  };
+
+  const getCorsProxiedUrl = (url: string): string => {
+    // For Caltrans, try direct first; if it fails, the error handler will retry with proxy
+    return url;
   };
 
   const getLiveUrl = (url: string) => {
@@ -492,6 +503,20 @@ function App() {
                         onLoad={() => setImgLoaded(true)}
                         onError={(e) => {
                           const img = e.target as HTMLImageElement;
+                          const url = img.src;
+                          
+                          // Retry with CORS proxy if applicable
+                          if (shouldRetryWithProxy(url) && !url.includes('cors-anywhere')) {
+                            const proxiedUrl = `https://cors-anywhere.herokuapp.com/${url.split('?')[0]}`;
+                            img.src = proxiedUrl;
+                            img.onload = () => {
+                              setImgLoaded(true);
+                              img.style.opacity = '1';
+                            };
+                            return;
+                          }
+                          
+                          // If all retries fail, show error fallback
                           img.style.display = 'none';
                           const fb = img.nextElementSibling as HTMLElement;
                           if (fb) fb.style.display = 'flex';
