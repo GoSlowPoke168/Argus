@@ -15,6 +15,7 @@
     "deck.gl": "^9.3.2",
     "framer-motion": "^12.38.0",
     "hls.js": "^1.6.16",
+    "i18n-iso-countries": "^7.14.0",
     "lucide-react": "^1.14.0",
     "mapbox-gl": "^3.23.1",
     "maplibre-gl": "^5.24.0",

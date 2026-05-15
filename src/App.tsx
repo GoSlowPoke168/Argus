@@ -1,12 +1,38 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer } from '@deck.gl/layers';
-import Map from 'react-map-gl/maplibre';
+import MapGL, { Source, Layer } from 'react-map-gl/maplibre';
+import type { MapMouseEvent } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown, Settings, Shuffle } from 'lucide-react';
+import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown, Settings, Shuffle, Filter, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Rnd } from 'react-rnd';
 import Hls from 'hls.js';
+import * as countries from 'i18n-iso-countries';
+import enLocale from 'i18n-iso-countries/langs/en.json';
+
+// Initialize ISO countries library
+countries.registerLocale(enLocale);
+
+// Global styles for custom scrollbar
+const scrollbarStyles = `
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 10px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #00e5ff;
+    border-radius: 10px;
+    border: 1px solid rgba(0, 229, 255, 0.4);
+    box-shadow: 0 0 10px rgba(0, 229, 255, 0.5);
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #33ebff;
+  }
+`;
 
 function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: number; onFallback?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -73,12 +99,18 @@ function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: nu
 }
 
 const INITIAL_VIEW_STATE = {
-  longitude: 10,
-  latitude: 25,
-  zoom: 2,
-  pitch: 30,
+  longitude: -95,
+  latitude: 38,
+  zoom: 1.5,
+  pitch: 0,
   bearing: 0,
-  minZoom: 1.5
+};
+
+// Custom overrides for non-standard codes or specific project needs
+const MANUAL_OVERRIDES: Record<string, string> = {
+  'XK': 'Kosovo',
+  'XKX': 'Kosovo',
+  'Global Sector': 'Global Sector'
 };
 
 interface CameraProperties {
@@ -193,28 +225,59 @@ function App() {
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [imgLoaded, setImgLoaded] = useState(false);
   const [isHudMinimized, setIsHudMinimized] = useState(false);
+  const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
   const [mouseCoords, setMouseCoords] = useState<[number, number] | null>(null);
   const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
   const [hlsFailed, setHlsFailed] = useState(false);
   const [imgLastLoaded, setImgLastLoaded] = useState<Date | null>(null);
   const [lastImageHash, setLastImageHash] = useState<string | null>(null);
   const [use24Hour, setUse24Hour] = useState(false);
+  const [is3D, setIs3D] = useState(false);
+  const [nodeOpacity, setNodeOpacity] = useState(0.8);
+  const [showBorders, setShowBorders] = useState(false);
+  const [filterCountries, setFilterCountries] = useState<string[]>([]);
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+  const [filterSearch, setFilterSearch] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const formatTime = (date: Date) => {
-    return date.toLocaleTimeString([], { 
-      hour: '2-digit', 
-      minute: '2-digit', 
+    return date.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
       second: '2-digit',
-      hour12: !use24Hour 
+      hour12: !use24Hour
     });
   };
 
+  // Sanitize viewState on mode switch to prevent matrix crashes
+  useEffect(() => {
+    setViewState(prev => ({
+      ...prev,
+      latitude: Number.isFinite(prev.latitude) ? prev.latitude : 38,
+      longitude: Number.isFinite(prev.longitude) ? prev.longitude : -95,
+      zoom: Number.isFinite(prev.zoom) ? prev.zoom : 1.5,
+      pitch: Number.isFinite(prev.pitch) ? prev.pitch : 0,
+      bearing: Number.isFinite(prev.bearing) ? prev.bearing : 0,
+    }));
+  }, [is3D]);
+
   const openRandomCamera = () => {
-    if (cameras.length === 0) return;
-    const randomIndex = Math.floor(Math.random() * cameras.length);
-    setSelectedCamera(cameras[randomIndex]);
+    const pool = filteredCameras.length > 0 ? filteredCameras : cameras;
+    if (pool.length === 0) return;
+    
+    const randomIndex = Math.floor(Math.random() * pool.length);
+    const cam = pool[randomIndex];
+    setSelectedCamera(cam);
+
+    if (cam.geometry.coordinates[0] && cam.geometry.coordinates[1]) {
+      setViewState(prev => ({
+        ...prev,
+        longitude: cam.geometry.coordinates[0],
+        latitude: cam.geometry.coordinates[1],
+        zoom: Math.max(prev.zoom, 10)
+      }));
+    }
   };
 
   useEffect(() => {
@@ -223,6 +286,70 @@ function App() {
       .then(data => { setCameras(data.features || []); setLoading(false); })
       .catch(() => setLoading(false));
   }, []);
+
+  const mapStyle = useMemo(() => "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json", []);
+
+  const getCountryName = (props: any) => {
+    const rawCountry = (props.country || '').toUpperCase();
+    const source = (props.source || '').toLowerCase();
+    const region = (props.region || '').toUpperCase();
+
+    // Consolidated US Sources
+    const isUS = rawCountry === 'US' || 
+                 rawCountry === 'USA' || 
+                 source.includes('caltrans') || 
+                 source.includes('road511') || 
+                 source.includes('nyc_dot') || 
+                 source.includes('iowa_dot');
+
+    if (isUS) return 'United States';
+    
+    const key = (props.country || props.region || 'unknown').toUpperCase();
+    
+    // Check manual overrides first
+    if (MANUAL_OVERRIDES[key]) return MANUAL_OVERRIDES[key];
+    
+    // Use dynamic ISO lookup
+    const resolved = countries.getName(key, 'en');
+    if (resolved) return resolved;
+
+    return key.length <= 3 ? key : 'Global Sector';
+  };
+
+  const countryStats = useMemo(() => {
+    const stats: Record<string, number> = {};
+    cameras.forEach(c => {
+      const name = getCountryName(c.properties);
+      stats[name] = (stats[name] || 0) + 1;
+    });
+    return Object.entries(stats).sort((a, b) => b[1] - a[1]);
+  }, [cameras]);
+
+  const filteredCameras = useMemo(() => {
+    if (filterCountries.length === 0) return cameras;
+    return cameras.filter(c => filterCountries.includes(getCountryName(c.properties)));
+  }, [cameras, filterCountries]);
+
+  const cameraMap = useMemo(() => {
+    const m = new window.Map<string, CameraFeature>();
+    filteredCameras.forEach(c => m.set(c.properties.id, c));
+    return m;
+  }, [filteredCameras]);
+
+  const camerasGeoJson = useMemo(() => ({
+    type: 'FeatureCollection',
+    features: filteredCameras
+  }), [filteredCameras]);
+
+  const hoveredGeoJson = useMemo(() => ({
+    type: 'FeatureCollection',
+    features: hovered ? [hovered] : []
+  }), [hovered]);
+
+  const selectedGeoJson = useMemo(() => ({
+    type: 'FeatureCollection',
+    features: selectedCamera ? [selectedCamera] : []
+  }), [selectedCamera]);
 
   // Auto-refresh every 15s
   useEffect(() => {
@@ -245,7 +372,7 @@ function App() {
     if (selectedCamera?.properties.source === 'windy') {
       const camId = selectedCamera.properties.id.replace('windy_', '');
       const apiKey = import.meta.env.VITE_WINDY_API_KEY;
-      
+
       if (apiKey) {
         fetch(`https://api.windy.com/webcams/api/v3/webcams/${camId}?include=images`, {
           headers: { 'x-windy-api-key': apiKey }
@@ -265,7 +392,7 @@ function App() {
     setImgCacheBust(Date.now());
     setLastRefresh(new Date());
     setImgLoaded(false);
-    
+
     // If it's a windy camera, force a re-fetch of the token
     if (selectedCamera?.properties.source === 'windy') {
       const camId = selectedCamera.properties.id.replace('windy_', '');
@@ -294,7 +421,7 @@ function App() {
     if (selectedCamera?.properties.source === 'windy') {
       if (liveWindyUrl) return liveWindyUrl;
     }
-    
+
     if (!url) return '';
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}_t=${imgCacheBust}`;
@@ -303,7 +430,7 @@ function App() {
   const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement, Event>) => {
     setImgLoaded(true);
     const img = e.target as HTMLImageElement;
-    
+
     try {
       // Create a small fingerprint of the image to detect actual content changes
       const canvas = document.createElement('canvas');
@@ -314,7 +441,7 @@ function App() {
         // This will throw a security error if the image doesn't have CORS headers
         ctx.drawImage(img, 0, 0, 16, 16);
         const fingerprint = canvas.toDataURL('image/jpeg', 0.1);
-        
+
         if (fingerprint !== lastImageHash) {
           setLastImageHash(fingerprint);
           setImgLastLoaded(new Date());
@@ -327,31 +454,72 @@ function App() {
     }
   };
 
-  const layers = [
+
+  const onMapClick = (e: MapMouseEvent) => {
+    const feature = e.features?.[0];
+    if (feature) {
+      const camId = feature.properties?.id;
+      const original = cameraMap.get(camId);
+      if (original) {
+        setSelectedCamera(original);
+        setHlsFailed(false);
+      }
+    }
+  };
+
+  const onMapMouseMove = (e: MapMouseEvent) => {
+    const feature = e.features?.[0];
+    if (feature) {
+      const camId = feature.properties?.id;
+      const original = cameraMap.get(camId);
+      setHovered(original || null);
+      if (Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
+        setMouseCoords([e.lngLat.lng, e.lngLat.lat]);
+      }
+      e.target.getCanvas().style.cursor = 'crosshair';
+    } else {
+      setHovered(null);
+      if (e.lngLat && Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
+        setMouseCoords([e.lngLat.lng, e.lngLat.lat]);
+      }
+      e.target.getCanvas().style.cursor = '';
+    }
+  };
+
+  const deckLayers = [
     new ScatterplotLayer<CameraFeature>({
-      id: 'camera-points',
-      data: cameras,
+      id: 'deck-points',
+      data: filteredCameras,
       getPosition: d => d.geometry.coordinates,
-      getFillColor: d => getStreamColor(d),
-      getRadius: 8000,
-      radiusMinPixels: 3,
-      radiusMaxPixels: 10,
+      getFillColor: d => {
+        const base = d.properties.streamUrl ? [0, 255, 136] : [0, 229, 255];
+        return [...base, nodeOpacity * 255];
+      },
+      getRadius: d => (hovered?.properties.id === d.properties.id ? 6000 : 3000),
+      radiusMinPixels: 0.4,
+      radiusMaxPixels: 4,
       pickable: true,
-      onClick: ({ object }) => object && setSelectedCamera(object),
-      onHover: ({ object }) => setHovered(object ?? null),
-      updateTriggers: { getFillColor: cameras }
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 255],
+      transitions: {
+        getRadius: 150
+      },
+      updateTriggers: {
+        getFillColor: [nodeOpacity],
+        getRadius: [hovered?.properties.id]
+      }
     }),
     ...(selectedCamera ? [
       new ScatterplotLayer<CameraFeature>({
         id: 'camera-highlight',
         data: [selectedCamera],
         getPosition: d => d.geometry.coordinates,
-        getFillColor: [255, 60, 60, 0], // transparent fill
-        getLineColor: [255, 60, 60, 255], // red border
-        lineWidthMinPixels: 2,
-        getRadius: 15000,
-        radiusMinPixels: 15,
-        radiusMaxPixels: 25,
+        getFillColor: [255, 60, 60, 0],
+        getLineColor: [255, 60, 60, 255],
+        lineWidthMinPixels: 1.5,
+        getRadius: 8000,
+        radiusMinPixels: 10,
+        radiusMaxPixels: 16,
         stroked: true,
         filled: true,
         updateTriggers: { getPosition: selectedCamera }
@@ -359,7 +527,7 @@ function App() {
     ] : [])
   ];
 
-  const counts = cameras.reduce((acc, c) => {
+  const counts = filteredCameras.reduce((acc, c) => {
     if (c.properties.streamUrl) {
       acc.live += 1;
     } else {
@@ -368,28 +536,162 @@ function App() {
     return acc;
   }, { live: 0, still: 0 });
 
-  const feedUrl   = selectedCamera?.properties.feedUrl ?? '';
-  const streamUrl  = selectedCamera?.properties.streamUrl ?? '';
-  const feedWorks  = selectedCamera ? isFeedWorking(feedUrl, streamUrl) : false;
+  const feedUrl = selectedCamera?.properties.feedUrl ?? '';
+  const streamUrl = selectedCamera?.properties.streamUrl ?? '';
+  const feedWorks = selectedCamera ? isFeedWorking(feedUrl, streamUrl) : false;
   // hasStream is true only when a stream URL exists AND it hasn't failed CORS/Network checks
-  const hasStream  = !!(streamUrl) && !hlsFailed;
+  const hasStream = !!(streamUrl) && !hlsFailed;
 
   return (
     <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
+      <style>{scrollbarStyles}</style>
       {/* Map */}
-      <DeckGL
-        initialViewState={INITIAL_VIEW_STATE}
-        controller={true}
-        layers={layers}
-        getCursor={({ isDragging }) => isDragging ? 'grabbing' : hovered ? 'crosshair' : 'grab'}
-        onHover={(info) => {
-          if (info.coordinate) setMouseCoords(info.coordinate as [number, number]);
-          else setMouseCoords(null);
-        }}
-        onMouseLeave={() => setMouseCoords(null)}
-      >
-        <Map mapStyle="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json" />
-      </DeckGL>
+      {is3D ? (
+        <MapGL
+          key="globe-map"
+          longitude={viewState.longitude}
+          latitude={viewState.latitude}
+          zoom={viewState.zoom}
+          pitch={viewState.pitch}
+          bearing={viewState.bearing}
+          onMove={e => {
+            if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
+              setViewState(e.viewState);
+            }
+          }}
+          mapStyle={mapStyle}
+          projection={{ type: 'globe' }}
+          onClick={onMapClick}
+          onMouseMove={onMapMouseMove}
+          onMouseLeave={() => {
+            setHovered(null);
+            setMouseCoords(null);
+          }}
+          interactiveLayerIds={['camera-points']}
+        >
+          <Source id="cameras" type="geojson" data={camerasGeoJson}>
+            <Layer
+              id="camera-points"
+              type="circle"
+              paint={{
+                'circle-radius': [
+                  'interpolate', ['linear'], ['zoom'],
+                  2, 1.2,
+                  6, 2.5,
+                  10, 4.5,
+                  14, 6
+                ],
+                'circle-color': [
+                  'case',
+                  ['all', ['has', 'streamUrl'], ['!=', ['get', 'streamUrl'], '']],
+                  '#00ff88',
+                  '#00e5ff'
+                ],
+                'circle-opacity': nodeOpacity,
+                'circle-pitch-alignment': 'map',
+                'circle-pitch-scale': 'map'
+              }}
+            />
+          </Source>
+          {selectedCamera && (
+            <Source id="selected-source" type="geojson" data={selectedGeoJson}>
+              <Layer
+                id="selected-highlight"
+                type="circle"
+                paint={{
+                  'circle-radius': [
+                    'interpolate', ['linear'], ['zoom'],
+                    2, 12,
+                    10, 20
+                  ],
+                  'circle-color': 'rgba(255, 60, 60, 0)',
+                  'circle-stroke-width': 2,
+                  'circle-stroke-color': '#ff3c3c',
+                  'circle-opacity': 1,
+                  'circle-pitch-alignment': 'map'
+                }}
+              />
+            </Source>
+          )}
+          {hovered && (
+            <Source id="hovered-source" type="geojson" data={hoveredGeoJson}>
+              <Layer
+                id="hover-highlight"
+                type="circle"
+                paint={{
+                  'circle-radius': [
+                    'interpolate', ['linear'], ['zoom'],
+                    2, 2,
+                    10, 6,
+                    14, 8
+                  ],
+                  'circle-color': '#ffffff',
+                  'circle-stroke-width': 1,
+                  'circle-stroke-color': '#ffffff',
+                  'circle-opacity': 1,
+                  'circle-pitch-alignment': 'map'
+                }}
+              />
+            </Source>
+          )}
+          {showBorders && (
+            <Source id="borders" type="geojson" data="https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson">
+              <Layer
+                id="country-borders"
+                type="line"
+                paint={{
+                  'line-color': '#ffab00',
+                  'line-width': 2.5,
+                  'line-opacity': 0.8
+                }}
+              />
+            </Source>
+          )}
+        </MapGL>
+      ) : (
+        <DeckGL
+          key="tactical-deck"
+          viewState={viewState}
+          onViewStateChange={e => {
+            if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
+              setViewState(e.viewState);
+            }
+          }}
+          controller={true}
+          layers={deckLayers}
+          onHover={({ object, coordinate }) => {
+            setHovered(object || null);
+            if (coordinate) setMouseCoords(coordinate as [number, number]);
+          }}
+          onClick={({ object }) => {
+            if (object) {
+              setSelectedCamera(object);
+              setHlsFailed(false);
+            }
+          }}
+          getCursor={({ isDragging }) => isDragging ? 'grabbing' : hovered ? 'crosshair' : 'grab'}
+        >
+          <MapGL
+            key="mercator-map"
+            mapStyle={mapStyle}
+            projection={{ type: 'mercator' }}
+          >
+            {showBorders && (
+              <Source id="borders-2d" type="geojson" data="https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson">
+                <Layer
+                  id="country-borders-2d"
+                  type="line"
+                  paint={{
+                    'line-color': '#ffab00',
+                    'line-width': 2.0,
+                    'line-opacity': 0.7
+                  }}
+                />
+              </Source>
+            )}
+          </MapGL>
+        </DeckGL>
+      )}
 
       {/* Vignette */}
       <div className="absolute inset-0 pointer-events-none"
@@ -398,18 +700,26 @@ function App() {
       {/* ── MOUSE COORDINATES ── */}
       {mouseCoords && (
         <div className="absolute bottom-8 left-8 z-30 pointer-events-none">
-          <div className="bg-[#05090C]/70 backdrop-blur-xl rounded-xl border border-white/10 px-6 py-4 flex items-center gap-4 shadow-2xl">
-            <Scan className="w-5 h-5 text-[#00e5ff]" />
-            <span className="text-[#00e5ff] text-base font-mono tracking-widest font-semibold">
-              {mouseCoords[1].toFixed(4)}, {mouseCoords[0].toFixed(4)}
-            </span>
+          <div className="bg-[#05090C]/70 backdrop-blur-xl rounded-xl border border-white/10 px-6 py-4 flex flex-col gap-2 shadow-2xl">
+            <div className="flex items-center gap-4">
+              <Scan className="w-5 h-5 text-[#00e5ff]" />
+              <span className="text-[#00e5ff] text-base font-mono tracking-widest font-semibold">
+                {mouseCoords[1].toFixed(4)}, {mouseCoords[0].toFixed(4)}
+              </span>
+            </div>
+            <div className="flex items-center gap-4 border-t border-white/5 pt-2">
+              <Activity className="w-4 h-4 text-gray-500" />
+              <span className="text-gray-500 text-xs font-mono uppercase tracking-[0.2em]">
+                Zoom: <span className="text-white">{(viewState.zoom * 10).toFixed(1)}%</span>
+              </span>
+            </div>
           </div>
         </div>
       )}
 
       {/* ── ARGUS HUD — TOP RIGHT ── */}
       <div style={{ position: 'absolute', top: 32, right: 32, zIndex: 30, width: 340 }} className="pointer-events-auto">
-        <motion.div 
+        <motion.div
           animate={{ height: isHudMinimized ? 120 : 'auto' }}
           className="bg-[#05090C]/70 backdrop-blur-2xl rounded-3xl border border-white/10 p-8 shadow-2xl relative overflow-hidden"
         >
@@ -422,7 +732,7 @@ function App() {
                 <p className="text-xs text-[#00e5ff] font-mono tracking-widest uppercase">Global Network</p>
               </div>
             </div>
-            <button 
+            <button
               onClick={() => setIsHudMinimized(!isHudMinimized)}
               className="p-1.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-gray-400 hover:text-white transition-all outline-none"
             >
@@ -486,7 +796,7 @@ function App() {
       {/* ── Hover Tooltip ── */}
       <AnimatePresence>
         {hovered && (
-          <motion.div 
+          <motion.div
             initial={{ opacity: 0, y: 10, scale: 0.95 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 5, scale: 0.95 }}
@@ -525,7 +835,7 @@ function App() {
         >
           {/* Main Container - Strict Flex Column */}
           <div className="bg-[#05090C]/75 backdrop-blur-3xl rounded-3xl border border-white/10 flex flex-col h-full shadow-[0_0_50px_rgba(0,0,0,0.8)] overflow-hidden">
-            
+
             {/* 1. Header Area (Fixed height) */}
             <div className="drag-handle cursor-move flex items-center justify-between p-6 bg-white/5 border-b border-white/10 flex-shrink-0">
               <div className="flex-1 min-w-0 pr-4">
@@ -553,7 +863,7 @@ function App() {
                   <p className="text-gray-400 text-xs truncate">{formatLocation(selectedCamera)}</p>
                 </div>
               </div>
-              
+
               {/* Controls */}
               <div className="flex items-center gap-2 flex-shrink-0">
                 {!hasStream && feedWorks && (
@@ -599,7 +909,7 @@ function App() {
                         onError={(e) => {
                           const img = e.target as HTMLImageElement;
                           const url = img.src;
-                          
+
                           // Retry with CORS proxy if applicable
                           if (shouldRetryWithProxy(url) && !url.includes('cors-anywhere')) {
                             const proxiedUrl = `https://cors-anywhere.herokuapp.com/${url.split('?')[0]}`;
@@ -610,7 +920,7 @@ function App() {
                             };
                             return;
                           }
-                          
+
                           // If all retries fail, show error fallback
                           img.style.display = 'none';
                           const fb = img.nextElementSibling as HTMLElement;
@@ -685,7 +995,7 @@ function App() {
                 )}
               </div>
             </div>
-            
+
           </div>
         </Rnd>
       ) : null}
@@ -695,15 +1005,26 @@ function App() {
         <AnimatePresence>
           {isSettingsOpen && (
             <motion.div
-              initial={{ opacity: 0, y: 20, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 10, scale: 0.95 }}
-              className="bg-[#05090C]/80 backdrop-blur-2xl rounded-2xl border border-white/10 p-6 shadow-2xl min-w-[240px] mb-2"
+              initial={{ opacity: 0, x: 20, scale: 0.95 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 20, scale: 0.95 }}
+              className="absolute bottom-0 right-20 bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-6 shadow-2xl min-w-[320px] flex flex-col z-50"
             >
-              <h3 className="text-white text-xs font-bold uppercase tracking-widest mb-6 flex items-center gap-2">
-                <Settings className="w-3.5 h-3.5 text-[#00e5ff]" /> System Config
-              </h3>
-              
+              <div className="flex items-center justify-between mb-8 flex-shrink-0">
+                <div>
+                  <h3 className="text-white text-lg font-bold tracking-tight flex items-center gap-2">
+                    <Settings className="w-5 h-5 text-[#00e5ff]" /> System Config
+                  </h3>
+                  <p className="text-gray-500 text-[10px] uppercase tracking-widest mt-1">Configure Dashboard HUD</p>
+                </div>
+                <button
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-400 hover:text-white hover:border-white/20 transition-all"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
               <div className="space-y-6">
                 <div className="flex items-center justify-between gap-8">
                   <div>
@@ -712,15 +1033,68 @@ function App() {
                   </div>
                   <button
                     onClick={() => setUse24Hour(!use24Hour)}
-                    className={`w-12 h-6 rounded-full transition-all duration-300 relative border ${
-                      use24Hour ? 'bg-[#00e5ff]/20 border-[#00e5ff]/50' : 'bg-white/5 border-white/10'
-                    }`}
+                    className={`w-12 h-6 rounded-full transition-all duration-300 relative border ${use24Hour ? 'bg-[#00e5ff]/20 border-[#00e5ff]/50' : 'bg-white/5 border-white/10'
+                      }`}
                   >
                     <motion.div
                       animate={{ x: use24Hour ? 26 : 4 }}
-                      className={`absolute top-1 w-3.5 h-3.5 rounded-full shadow-lg ${
-                        use24Hour ? 'bg-[#00e5ff]' : 'bg-gray-500'
+                      className={`absolute top-1 w-3.5 h-3.5 rounded-full shadow-lg ${use24Hour ? 'bg-[#00e5ff]' : 'bg-gray-500'
+                        }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="flex flex-col gap-4 mb-6">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-gray-200 text-sm font-semibold">Node Opacity</p>
+                      <p className="text-gray-500 text-[10px] uppercase tracking-wider mt-1">Adjust point visibility</p>
+                    </div>
+                    <span className="text-[#00e5ff] font-mono text-xs">{Math.round(nodeOpacity * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={nodeOpacity}
+                    onChange={(e) => setNodeOpacity(parseFloat(e.target.value))}
+                    className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-[#00e5ff]"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-8 mb-4">
+                  <div>
+                    <p className="text-gray-200 text-sm font-semibold">Country Borders</p>
+                    <p className="text-gray-500 text-[10px] uppercase tracking-wider mt-1">Show political boundaries</p>
+                  </div>
+                  <button
+                    onClick={() => setShowBorders(!showBorders)}
+                    className={`w-12 h-6 rounded-full transition-all duration-300 relative border ${showBorders ? 'bg-[#ffab00]/20 border-[#ffab00]/50' : 'bg-white/5 border-white/10'
                       }`}
+                  >
+                    <motion.div
+                      animate={{ x: showBorders ? 26 : 4 }}
+                      className={`absolute top-1 w-3.5 h-3.5 rounded-full shadow-lg ${showBorders ? 'bg-[#ffab00]' : 'bg-gray-500'
+                        }`}
+                    />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between gap-8">
+                  <div>
+                    <p className="text-gray-200 text-sm font-semibold">3D Globe Mode</p>
+                    <p className="text-gray-500 text-[10px] uppercase tracking-wider mt-1">Render world sphere</p>
+                  </div>
+                  <button
+                    onClick={() => setIs3D(!is3D)}
+                    className={`w-12 h-6 rounded-full transition-all duration-300 relative border ${is3D ? 'bg-emerald-500/20 border-emerald-500/50' : 'bg-white/5 border-white/10'
+                      }`}
+                  >
+                    <motion.div
+                      animate={{ x: is3D ? 26 : 4 }}
+                      className={`absolute top-1 w-3.5 h-3.5 rounded-full shadow-lg ${is3D ? 'bg-emerald-500' : 'bg-gray-500'
+                        }`}
                     />
                   </button>
                 </div>
@@ -728,6 +1102,96 @@ function App() {
 
               <div className="mt-6 pt-6 border-t border-white/5">
                 <p className="text-[10px] text-gray-600 font-mono text-center uppercase tracking-widest">Argus v1.4.2 · Secure</p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* ── SECTOR FILTER PANEL ── */}
+        <AnimatePresence>
+          {isFilterOpen && (
+            <motion.div
+              initial={{ opacity: 0, x: 20, scale: 0.95 }}
+              animate={{ opacity: 1, x: 0, scale: 1 }}
+              exit={{ opacity: 0, x: 20, scale: 0.95 }}
+              className="absolute bottom-0 right-20 w-80 h-[440px] bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-6 shadow-2xl z-50 overflow-hidden flex flex-col"
+            >
+              <div className="flex items-center justify-between mb-6 flex-shrink-0">
+                <div>
+                  <h3 className="text-white text-lg font-bold tracking-tight">Sector Filter</h3>
+                  <div className="flex items-center gap-2 mt-1">
+                    <p className="text-gray-500 text-[10px] uppercase tracking-widest">
+                      {filterCountries.length === 0 ? 'Showing All Sectors' : `${filterCountries.length} Sectors Active`}
+                    </p>
+                    {filterCountries.length > 0 && (
+                      <button
+                        onClick={() => setFilterCountries([])}
+                        className="text-[10px] text-[#00e5ff] font-mono uppercase tracking-widest hover:text-white transition-colors"
+                      >
+                        (Reset)
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsFilterOpen(false)}
+                  className="w-8 h-8 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-400 hover:text-white hover:border-white/20 transition-all"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="mb-4 relative">
+                <input 
+                  type="text"
+                  placeholder="SEARCH SECTORS..."
+                  value={filterSearch}
+                  onChange={(e) => setFilterSearch(e.target.value)}
+                  className="w-full bg-white/5 border border-white/10 rounded-xl py-2 px-4 text-xs text-white placeholder:text-gray-600 focus:outline-none focus:border-[#00e5ff]/50 focus:bg-white/10 transition-all font-mono tracking-widest"
+                />
+                {filterSearch && (
+                  <button 
+                    onClick={() => setFilterSearch('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white transition-colors"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex-1 overflow-y-auto pr-2 space-y-2 custom-scrollbar">
+                {countryStats
+                  .filter(([name]) => name.toLowerCase().includes(filterSearch.toLowerCase()))
+                  .map(([name, count]) => {
+                  const isActive = filterCountries.includes(name);
+                  return (
+                    <button
+                      key={name}
+                      onClick={() => {
+                        if (isActive) {
+                          setFilterCountries(filterCountries.filter(c => c !== name));
+                        } else {
+                          setFilterCountries([...filterCountries, name]);
+                        }
+                      }}
+                      className={`w-full flex items-center justify-between p-3 rounded-xl border transition-all ${isActive
+                        ? 'bg-[#00e5ff]/10 border-[#00e5ff]/30 text-[#00e5ff]'
+                        : 'bg-white/5 border-white/5 text-gray-400 hover:bg-white/10 hover:border-white/10'
+                        }`}
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${isActive ? 'bg-[#00e5ff] border-[#00e5ff]' : 'border-white/20'
+                          }`}>
+                          {isActive && <Check className="w-3 h-3 text-[#05090C]" />}
+                        </div>
+                        <span className="text-xs font-medium truncate">{name}</span>
+                      </div>
+                      <span className={`text-[10px] font-mono font-bold ${isActive ? 'text-[#00e5ff]' : 'text-gray-500'}`}>
+                        {count.toLocaleString()}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </motion.div>
           )}
@@ -742,12 +1206,27 @@ function App() {
         </button>
 
         <button
-          onClick={() => setIsSettingsOpen(!isSettingsOpen)}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl border ${
-            isSettingsOpen 
-              ? 'bg-[#00e5ff] border-[#00e5ff] text-[#05090C] rotate-90 scale-110' 
-              : 'bg-[#05090C]/70 backdrop-blur-xl border-white/10 text-gray-400 hover:text-white hover:border-white/20'
-          }`}
+          onClick={() => {
+            setIsFilterOpen(!isFilterOpen);
+            if (isSettingsOpen) setIsSettingsOpen(false);
+          }}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl border ${isFilterOpen
+            ? 'bg-[#00e5ff] border-[#00e5ff] text-[#05090C] scale-110'
+            : 'bg-[#05090C]/70 backdrop-blur-xl border-white/10 text-gray-400 hover:text-white hover:border-white/20'
+            }`}
+        >
+          <Filter className="w-6 h-6" />
+        </button>
+
+        <button
+          onClick={() => {
+            setIsSettingsOpen(!isSettingsOpen);
+            if (isFilterOpen) setIsFilterOpen(false);
+          }}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl border ${isSettingsOpen
+            ? 'bg-[#00e5ff] border-[#00e5ff] text-[#05090C] rotate-90 scale-110'
+            : 'bg-[#05090C]/70 backdrop-blur-xl border-white/10 text-gray-400 hover:text-white hover:border-white/20'
+            }`}
         >
           <Settings className={`w-6 h-6 ${isSettingsOpen ? 'animate-none' : 'group-hover:rotate-45 transition-transform'}`} />
         </button>
