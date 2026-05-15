@@ -8,13 +8,13 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Rnd } from 'react-rnd';
 import Hls from 'hls.js';
 
-function HlsPlayer({ url, cacheBust }: { url: string; cacheBust?: number }) {
+function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: number; onFallback?: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     if (!videoRef.current) return;
-    
-    // If it's a direct MP4 video, use native video src
+
+    // Direct MP4 — use native video src
     if (url.toLowerCase().includes('.mp4')) {
       const sep = url.includes('?') ? '&' : '?';
       videoRef.current.src = cacheBust ? `${url}${sep}_t=${cacheBust}` : url;
@@ -31,16 +31,27 @@ function HlsPlayer({ url, cacheBust }: { url: string; cacheBust?: number }) {
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
       });
+      // Fatal error (403, network, parse failure) → signal parent to fall back to static image
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (data.fatal) {
+          console.warn(`HLS fatal error on ${url}:`, data.type, data.details);
+          hls?.destroy();
+          onFallback?.();
+        }
+      });
     } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
       videoRef.current.src = url;
       videoRef.current.addEventListener('loadedmetadata', () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
       });
+      // Native HLS error fallback
+      videoRef.current.addEventListener('error', () => onFallback?.());
+    } else {
+      // HLS not supported at all
+      onFallback?.();
     }
 
-    return () => {
-      if (hls) hls.destroy();
-    };
+    return () => { if (hls) hls.destroy(); };
   }, [url]);
 
   useEffect(() => {
@@ -104,23 +115,57 @@ const COUNTRY_NAMES: Record<string, string> = {
 
 // Domains confirmed to serve embeddable images without hotlink protection
 const WORKING_IMAGE_DOMAINS = [
-  'drivebc.ca',
-  'cwwp2.dot.ca.gov',    // Caltrans California static JPEGs
+  // ── Existing dedicated plugins ──────────────────────────────────────────
+  'drivebc.ca',           // DriveBC — British Columbia
+  'cwwp2.dot.ca.gov',    // Caltrans — California
   'images.data.gov.sg',  // Singapore LTA
   'imgproxy.windy.com',  // Windy Webcams
-  'tripcheck.com',       // Oregon TripCheck
-  'skyvdn.com',          // Iowa DOT (iowadotsnapshot.us-east-1.skyvdn.com)
+  'webcams.nyctmc.org',  // NYC DOT
   'nzta.govt.nz',        // New Zealand NZTA
   'tfl.gov.uk',          // London TfL
-  'amazonaws.com',       // TfL / NZTA / Iowa DOT S3 buckets
-  'cloudfront.net',      // CDN
-  'webcams.nyctmc.org',  // NYC DOT
+  'amazonaws.com',       // S3-hosted feeds (TfL, Iowa, SC, etc.)
+  'cloudfront.net',      // CloudFront CDN
+
+  // ── Road511 USA state DOT domains ───────────────────────────────────────
+  'fl511.com',           // Florida (4,136 cameras)
+  'udottraffic.utah.gov',// Utah (2,035 cameras)
+  '511ny.org',           // New York state (1,702 cameras)
+  'wsdot.wa.gov',        // Washington (1,452 cameras)
+  'carsprogram.org',     // Indiana / Colorado / Kansas (CARS camera network)
+  'tripcheck.com',       // Oregon TripCheck
+  'skyvdn.com',          // Iowa / South Carolina DOT CDN
+  'tnsnapshots.com',     // Tennessee (668 cameras)
+  'az511.com',           // Arizona (643 cameras)
+  'idrivearkansas.com',  // Arkansas (545 cameras)
+  'iowadot.gov',         // Iowa DOT (atmsqf.iowadot.gov RWIS snapshots)
+  'dot.state.oh.us',     // Ohio (itscameras.dot.state.oh.us)
+  'nebraska.gov',        // Nebraska (dot511.nebraska.gov)
+  'deldot.gov',          // Delaware (video.deldot.gov)
+  'kcscout.net',         // Kansas City Scout cameras
+  'trimarc.org',         // Kentucky (Louisville TRIMARC)
+  'wyoroad.info',        // Wyoming (www.wyoroad.info)
+  'dot.nd.gov',          // North Dakota
+  'streamlock.net',      // Massachusetts (Wowza streaming)
+  'iteris-atis.com',     // South Dakota
+  'trafficnz.info',      // New Zealand (trafficnz.info highway cameras)
 ];
 
-function isFeedWorking(url: string): boolean {
+function isFeedWorking(feedUrl: string, streamUrl?: string): boolean {
+  // A feed works if EITHER the image URL is on a known-good domain,
+  // OR there is a valid stream URL (HLS etc.) available.
+  if (streamUrl && streamUrl.trim()) return true;
+  if (!feedUrl) return false;
+  return WORKING_IMAGE_DOMAINS.some(d => feedUrl.includes(d));
+}
+
+// Returns true if the feedUrl is a direct image (not a webpage/player link)
+function isDirectImageUrl(url: string): boolean {
   if (!url) return false;
-  // Return true if domain is in the working list (not a guarantee, but a good indicator)
-  return WORKING_IMAGE_DOMAINS.some(d => url.includes(d));
+  const lower = url.toLowerCase();
+  // 511ny.org/map/Cctv/... are webpages serving images via redirect
+  // but the browser <img> tag can't always render them without CORS issues
+  const knownWebpagePatterns = ['511ny.org/map', '511.org/map', '/map/Cctv'];
+  return !knownWebpagePatterns.some(p => url.includes(p));
 }
 
 function shouldRetryWithProxy(url: string): boolean {
@@ -152,6 +197,9 @@ function App() {
   const [isHudMinimized, setIsHudMinimized] = useState(false);
   const [mouseCoords, setMouseCoords] = useState<[number, number] | null>(null);
   const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
+  const [hlsFailed, setHlsFailed] = useState(false);
+  const [imgLastLoaded, setImgLastLoaded] = useState<Date | null>(null);
+  const [lastImageHash, setLastImageHash] = useState<string | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -175,6 +223,9 @@ function App() {
     setImgLoaded(false);
     setImgCacheBust(Date.now());
     setLiveWindyUrl(null);
+    setHlsFailed(false); // reset on every camera change
+    setImgLastLoaded(null); // reset image timestamp on camera change
+    setLastImageHash(null); // reset hash on camera change
 
     if (selectedCamera?.properties.source === 'windy') {
       const camId = selectedCamera.properties.id.replace('windy_', '');
@@ -226,14 +277,39 @@ function App() {
 
   const getLiveUrl = (url: string) => {
     if (selectedCamera?.properties.source === 'windy') {
-      // If we have a fresh token URL, use it
       if (liveWindyUrl) return liveWindyUrl;
-      // Otherwise fallback to the one in geojson until fetch completes
     }
     
     if (!url) return '';
     const sep = url.includes('?') ? '&' : '?';
     return `${url}${sep}_t=${imgCacheBust}`;
+  };
+
+  const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement, Event>) => {
+    setImgLoaded(true);
+    const img = e.target as HTMLImageElement;
+    
+    try {
+      // Create a small fingerprint of the image to detect actual content changes
+      const canvas = document.createElement('canvas');
+      canvas.width = 16;
+      canvas.height = 16;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        // This will throw a security error if the image doesn't have CORS headers
+        ctx.drawImage(img, 0, 0, 16, 16);
+        const fingerprint = canvas.toDataURL('image/jpeg', 0.1);
+        
+        if (fingerprint !== lastImageHash) {
+          setLastImageHash(fingerprint);
+          setImgLastLoaded(new Date());
+        }
+      }
+    } catch (err) {
+      // Fallback for non-CORS images: update timestamp on every successful load
+      // because we can't inspect the pixels to know if it's the same.
+      setImgLastLoaded(new Date());
+    }
   };
 
   const layers = [
@@ -277,8 +353,11 @@ function App() {
     return acc;
   }, { live: 0, still: 0 });
 
-  const feedWorks = selectedCamera ? isFeedWorking(selectedCamera.properties.feedUrl) : false;
-  const hasStream = !!(selectedCamera?.properties.streamUrl);
+  const feedUrl   = selectedCamera?.properties.feedUrl ?? '';
+  const streamUrl  = selectedCamera?.properties.streamUrl ?? '';
+  const feedWorks  = selectedCamera ? isFeedWorking(feedUrl, streamUrl) : false;
+  // hasStream is true only when a stream URL exists AND HLS hasn't already failed
+  const hasStream  = (!hlsFailed && !!(streamUrl)) || (!isDirectImageUrl(feedUrl) && feedWorks && !hlsFailed);
 
   return (
     <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
@@ -486,7 +565,7 @@ function App() {
                     </div>
                   )}
                   {hasStream ? (
-                    <HlsPlayer url={selectedCamera.properties.streamUrl!} cacheBust={imgCacheBust} />
+                    <HlsPlayer url={streamUrl || feedUrl} cacheBust={imgCacheBust} onFallback={() => setHlsFailed(true)} />
                   ) : (
                     <>
                       {!imgLoaded && (
@@ -497,10 +576,11 @@ function App() {
                       <img
                         key={`${selectedCamera.properties.id}-${imgCacheBust}`}
                         src={getLiveUrl(selectedCamera.properties.feedUrl)}
+                        crossOrigin="anonymous"
                         alt={selectedCamera.properties.name}
                         className="w-full h-full object-contain"
                         style={{ opacity: imgLoaded ? 1 : 0 }}
-                        onLoad={() => setImgLoaded(true)}
+                        onLoad={handleImageLoad}
                         onError={(e) => {
                           const img = e.target as HTMLImageElement;
                           const url = img.src;
@@ -576,6 +656,16 @@ function App() {
                         <span className="text-gray-500 text-[9px] mt-0.5 tracking-wider uppercase">Source updates every 5m</span>
                       )}
                     </div>
+                  </div>
+                )}
+                {feedWorks && !hasStream && imgLastLoaded && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500 text-xs font-semibold tracking-wide uppercase flex items-center gap-1.5">
+                      <Clock className="w-4 h-4" /> Image Updated
+                    </span>
+                    <span className="text-emerald-400 text-sm font-mono truncate ml-4">
+                      {imgLastLoaded.toLocaleTimeString()}
+                    </span>
                   </div>
                 )}
               </div>
