@@ -3,7 +3,7 @@ import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer } from '@deck.gl/layers';
 import Map from 'react-map-gl/maplibre';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown } from 'lucide-react';
+import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown, Settings, Shuffle } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Rnd } from 'react-rnd';
 import Hls from 'hls.js';
@@ -31,10 +31,10 @@ function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: nu
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
       });
-      // Fatal error (403, network, parse failure) → signal parent to fall back to static image
+      // Detect CORS blocks or dead streams and switch to static image fallback
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (data.fatal) {
-          console.warn(`HLS fatal error on ${url}:`, data.type, data.details);
+          console.log(`[Argus] Stream ${data.details} - falling back to static image.`);
           hls?.destroy();
           onFallback?.();
         }
@@ -44,10 +44,8 @@ function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: nu
       videoRef.current.addEventListener('loadedmetadata', () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
       });
-      // Native HLS error fallback
       videoRef.current.addEventListener('error', () => onFallback?.());
     } else {
-      // HLS not supported at all
       onFallback?.();
     }
 
@@ -150,6 +148,15 @@ const WORKING_IMAGE_DOMAINS = [
   'trafficnz.info',      // New Zealand (trafficnz.info highway cameras)
 ];
 
+// Domains known to support CORS headers for image fingerprinting
+const CORS_ENABLED_DOMAINS = [
+  'imgproxy.windy.com',
+  'amazonaws.com',
+  'cloudfront.net',
+  'images.data.gov.sg',
+  'nzta.govt.nz'
+];
+
 function isFeedWorking(feedUrl: string, streamUrl?: string): boolean {
   // A feed works if EITHER the image URL is on a known-good domain,
   // OR there is a valid stream URL (HLS etc.) available.
@@ -158,15 +165,6 @@ function isFeedWorking(feedUrl: string, streamUrl?: string): boolean {
   return WORKING_IMAGE_DOMAINS.some(d => feedUrl.includes(d));
 }
 
-// Returns true if the feedUrl is a direct image (not a webpage/player link)
-function isDirectImageUrl(url: string): boolean {
-  if (!url) return false;
-  const lower = url.toLowerCase();
-  // 511ny.org/map/Cctv/... are webpages serving images via redirect
-  // but the browser <img> tag can't always render them without CORS issues
-  const knownWebpagePatterns = ['511ny.org/map', '511.org/map', '/map/Cctv'];
-  return !knownWebpagePatterns.some(p => url.includes(p));
-}
 
 function shouldRetryWithProxy(url: string): boolean {
   // Caltrans cameras may need retry with proxy if direct load fails
@@ -200,7 +198,24 @@ function App() {
   const [hlsFailed, setHlsFailed] = useState(false);
   const [imgLastLoaded, setImgLastLoaded] = useState<Date | null>(null);
   const [lastImageHash, setLastImageHash] = useState<string | null>(null);
+  const [use24Hour, setUse24Hour] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const formatTime = (date: Date) => {
+    return date.toLocaleTimeString([], { 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      hour12: !use24Hour 
+    });
+  };
+
+  const openRandomCamera = () => {
+    if (cameras.length === 0) return;
+    const randomIndex = Math.floor(Math.random() * cameras.length);
+    setSelectedCamera(cameras[randomIndex]);
+  };
 
   useEffect(() => {
     fetch('/cameras.geojson')
@@ -356,8 +371,8 @@ function App() {
   const feedUrl   = selectedCamera?.properties.feedUrl ?? '';
   const streamUrl  = selectedCamera?.properties.streamUrl ?? '';
   const feedWorks  = selectedCamera ? isFeedWorking(feedUrl, streamUrl) : false;
-  // hasStream is true only when a stream URL exists AND HLS hasn't already failed
-  const hasStream  = (!hlsFailed && !!(streamUrl)) || (!isDirectImageUrl(feedUrl) && feedWorks && !hlsFailed);
+  // hasStream is true only when a stream URL exists AND it hasn't failed CORS/Network checks
+  const hasStream  = !!(streamUrl) && !hlsFailed;
 
   return (
     <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
@@ -576,7 +591,7 @@ function App() {
                       <img
                         key={`${selectedCamera.properties.id}-${imgCacheBust}`}
                         src={getLiveUrl(selectedCamera.properties.feedUrl)}
-                        crossOrigin="anonymous"
+                        crossOrigin={CORS_ENABLED_DOMAINS.some(d => selectedCamera.properties.feedUrl.includes(d)) ? "anonymous" : undefined}
                         alt={selectedCamera.properties.name}
                         className="w-full h-full object-contain"
                         style={{ opacity: imgLoaded ? 1 : 0 }}
@@ -650,7 +665,7 @@ function App() {
                     </span>
                     <div className="flex flex-col items-end">
                       <span className="text-[#00e5ff] text-sm font-mono truncate ml-4">
-                        {lastRefresh.toLocaleTimeString()}
+                        {formatTime(lastRefresh)}
                       </span>
                       {selectedCamera.properties.source === 'tfl_london' && (
                         <span className="text-gray-500 text-[9px] mt-0.5 tracking-wider uppercase">Source updates every 5m</span>
@@ -664,7 +679,7 @@ function App() {
                       <Clock className="w-4 h-4" /> Image Updated
                     </span>
                     <span className="text-emerald-400 text-sm font-mono truncate ml-4">
-                      {imgLastLoaded.toLocaleTimeString()}
+                      {formatTime(imgLastLoaded)}
                     </span>
                   </div>
                 )}
@@ -674,6 +689,69 @@ function App() {
           </div>
         </Rnd>
       ) : null}
+
+      {/* ── SETTINGS MENU ── */}
+      <div className="absolute bottom-8 right-8 z-50 flex flex-col items-end gap-4">
+        <AnimatePresence>
+          {isSettingsOpen && (
+            <motion.div
+              initial={{ opacity: 0, y: 20, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 10, scale: 0.95 }}
+              className="bg-[#05090C]/80 backdrop-blur-2xl rounded-2xl border border-white/10 p-6 shadow-2xl min-w-[240px] mb-2"
+            >
+              <h3 className="text-white text-xs font-bold uppercase tracking-widest mb-6 flex items-center gap-2">
+                <Settings className="w-3.5 h-3.5 text-[#00e5ff]" /> System Config
+              </h3>
+              
+              <div className="space-y-6">
+                <div className="flex items-center justify-between gap-8">
+                  <div>
+                    <p className="text-gray-200 text-sm font-semibold">Military Time</p>
+                    <p className="text-gray-500 text-[10px] uppercase tracking-wider mt-1">24-hour format</p>
+                  </div>
+                  <button
+                    onClick={() => setUse24Hour(!use24Hour)}
+                    className={`w-12 h-6 rounded-full transition-all duration-300 relative border ${
+                      use24Hour ? 'bg-[#00e5ff]/20 border-[#00e5ff]/50' : 'bg-white/5 border-white/10'
+                    }`}
+                  >
+                    <motion.div
+                      animate={{ x: use24Hour ? 26 : 4 }}
+                      className={`absolute top-1 w-3.5 h-3.5 rounded-full shadow-lg ${
+                        use24Hour ? 'bg-[#00e5ff]' : 'bg-gray-500'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-6 pt-6 border-t border-white/5">
+                <p className="text-[10px] text-gray-600 font-mono text-center uppercase tracking-widest">Argus v1.4.2 · Secure</p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <button
+          onClick={openRandomCamera}
+          title="Open Random Camera"
+          className="w-14 h-14 rounded-full bg-[#05090C]/70 backdrop-blur-xl border border-white/10 text-gray-400 hover:text-[#00ff88] hover:border-[#00ff88]/50 flex items-center justify-center transition-all duration-300 shadow-2xl group"
+        >
+          <Shuffle className="w-6 h-6 group-hover:scale-110 transition-transform" />
+        </button>
+
+        <button
+          onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl border ${
+            isSettingsOpen 
+              ? 'bg-[#00e5ff] border-[#00e5ff] text-[#05090C] rotate-90 scale-110' 
+              : 'bg-[#05090C]/70 backdrop-blur-xl border-white/10 text-gray-400 hover:text-white hover:border-white/20'
+          }`}
+        >
+          <Settings className={`w-6 h-6 ${isSettingsOpen ? 'animate-none' : 'group-hover:rotate-45 transition-transform'}`} />
+        </button>
+      </div>
     </div>
   );
 }
