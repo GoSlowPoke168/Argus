@@ -2,16 +2,20 @@
 
 Argus is a high-performance, tactical surveillance dashboard that aggregates and visualizes global open-data camera feeds. It provides real-time monitoring of **~95,000+ camera nodes** across highways, landmarks, and urban centers worldwide.
 
-![Argus Tactical UI](src/assets/DemoInterface.png)
+## Demo
+
+![Argus Tactical UI](src/assets/DemoInterface1.png)
+
+![Argus Tactical UI](src/assets/DemoInterface2.png)
 
 ---
 
-## Core Features
+## Features
 
-- **Massive Global Scale** — ~95,000 cameras across 120+ countries
-- **Real-Time Visualization** — High-performance map rendering via Deck.GL and MapLibre
-- **Hybrid Feed Support** — Live HLS video (.m3u8) where available, falls back to high-frequency static JPEG
-- **Unified Plugin Engine** — One command to run any combination of regional scrapers
+- **Global Surveillance Scale** — Comprehensive visualization of ~95,000 nodes across 120+ international sectors.
+- **Geospatial Rendering** — GPU-accelerated tactical mapping utilizing Deck.GL and MapLibre for seamless navigation.
+- **Adaptive Stream Processing** — Intelligent feed management supporting low-latency HLS video and high-frequency imaging.
+- **Modular Ingestion Framework** — Extensible Python-based pipeline for multi-source data aggregation and standardization.
 
 ---
 
@@ -143,15 +147,15 @@ python scraper.py --plugins windy
 
 | Plugin Alias | Source | Region | Camera Count | Live HLS? | API Key |
 |:---|:---|:---|:---|:---|:---|
-| `windy` | [Windy Webcams](https://api.windy.com/) | 🌍 Global | ~73,700 | ✅ Some | ✅ Required (Free) |
-| `road511_usa` | [Road511](https://api.road511.com/) | 20 US States | ~15,000 | ✅ CO, TN, DE | ❌ None |
-| `caltrans` | [Caltrans CCTV](https://cwwp2.dot.ca.gov/) | California, USA | ~3,300 | ✅ Yes | ❌ None |
-| `nyc_dot` | [NYC TMC](https://webcams.nyctmc.org/) | New York City, USA | ~950 | ❌ Image only | ❌ None |
-| `iowa_dot` | [Iowa DOT](https://services.arcgis.com/8lRhdTsQyJpO52F1/ArcGIS/rest/services/Traffic_Cameras_View/FeatureServer/0) | Iowa, USA | ~850 | ✅ Yes | ❌ None |
-| `drivebc` | [DriveBC](https://www.drivebc.ca/) | British Columbia, CA | ~1,040 | ❌ Image only | ❌ None |
-| `tfl_london` | [Transport for London](https://api.tfl.gov.uk/) | London, UK | ~800 | ❌ Image only | ❌ None |
-| `singapore_lta` | [Singapore LTA](https://data.gov.sg/) | Singapore | ~90 | ❌ Image only | ❌ None |
-| `nzta` | [NZTA Journeys](https://www.journeys.nzta.govt.nz/) | New Zealand | ~varies | ❌ Image only | ❌ None |
+| `windy` | [Windy Webcams](https://api.windy.com/) | 🌍 Global | ~73,700 | ❌ Image only | ✅ Required (Free) |
+| `road511_usa` | [Road511](https://api.road511.com/) | 🇺🇸 United States | ~15,000 | ✅ CO, TN, DE | ❌ None |
+| `caltrans` | [Caltrans CCTV](https://cwwp2.dot.ca.gov/) | 🇺🇸 California, USA | ~3,300 | ✅ Yes | ❌ None |
+| `nyc_dot` | [NYC TMC](https://webcams.nyctmc.org/) | 🇺🇸 New York City, USA | ~950 | ❌ Image only | ❌ None |
+| `iowa_dot` | [Iowa DOT](https://services.arcgis.com/8lRhdTsQyJpO52F1/ArcGIS/rest/services/Traffic_Cameras_View/FeatureServer/0) | 🇺🇸 Iowa, USA | ~850 | ✅ Yes | ❌ None |
+| `drivebc` | [DriveBC](https://www.drivebc.ca/) | 🇨🇦 British Columbia, CA | ~1,040 | ❌ Image only | ❌ None |
+| `tfl_london` | [Transport for London](https://api.tfl.gov.uk/) | 🇬🇧 London, UK | ~800 | ❌ Image only | ❌ None |
+| `singapore_lta` | [Singapore LTA](https://data.gov.sg/) | 🇸🇬 Singapore | ~90 | ❌ Image only | ❌ None |
+| `nzta` | [NZTA Journeys](https://www.journeys.nzta.govt.nz/) | 🇳🇿 New Zealand | ~varies | ❌ Image only | ❌ None |
 
 ### Road511 State Coverage
 
