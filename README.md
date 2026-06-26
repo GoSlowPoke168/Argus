@@ -315,6 +315,12 @@ VITE_WINDY_API_KEY=your_windy_key_here
 
 ---
 
+## TODO:
+- [ ] Add Satellite Camereas from https://eumetview.eumetsat.int/static-images/latestImages.html
+- [ ] Add Cameras from https://opencctv.org/api/hls-seg
+
+---
+
 ## License
 
 This project is for educational and open-data visualization purposes only. All camera feeds are sourced from public, non-sensitive government or commercial APIs.
