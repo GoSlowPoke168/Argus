@@ -22,14 +22,14 @@ Usage:
 import os
 import sys
 import importlib
-import json
 import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from scrapers.utils import log, load_geojson, save_geojson, merge_features
+from scrapers.utils import log, log_progress
+import store
 
 
 # ─────────────────────────────────────────────────────────
@@ -90,6 +90,12 @@ PLUGIN_REGISTRY = {
         "key":         None,
         "description": "~15,000 cameras across 20 US states. Use --states CO TN DE to target specific states.",
     },
+    "opencctv_bridge": {
+        "module":      "scrapers.opencctv_bridge",
+        "name":        "OpenCCTV Strategic Bridge",
+        "key":         None,
+        "description": "Synchronizes 200k+ global nodes from the OpenCCTV network",
+    },
 }
 
 
@@ -107,6 +113,7 @@ def _build_source_map(states_override=None):
         "tfl_london":    "tfl_london",
         "nzta":          "nzta",
         "iowa_dot":      "iowa_dot",
+        "opencctv_bridge": "opencctv_*", # trailing * = prefix delete (opencctv_<src>)
     }
     _all_road511_states = [
         "fl","ga","co","in","ut","nv","wa","pa","or","mi","ky","sc","ma","tn",
@@ -141,12 +148,16 @@ _load_env()
 
 CONFIG = {
     "WINDY_API_KEY":              os.getenv("WINDY_API_KEY"),
+    "OPENCCTV_MAX":               os.getenv("OPENCCTV_MAX"),  # cap harvest size (testing)
     "TIMEOUT":                    15,
     "REQUEST_DELAY":              0.5,
     "WINDY_GRID_SIZE":            20,
     "WINDY_SATURATION_THRESHOLD": 999,
     "WINDY_MAX_DEPTH":            5,
     "WINDY_BATCH_SIZE":           50,
+    "WINDY_MAX_WORKERS":          6,    # concurrent boxes (mirrors opencctv's polite pool)
+    "WINDY_RATE_LIMIT_RPS":       8,    # aggregate request/sec cap across all workers
+    "WINDY_EXPECTED_TOTAL":       73000,  # progress-bar ETA target when no prior count exists
 }
 
 
@@ -190,7 +201,25 @@ Examples:
     sel.add_argument("--list",    action="store_true",
                      help="List all registered plugins and exit")
     sel.add_argument("--stats",   action="store_true",
-                     help="Show camera counts by source and region from the current geojson, then exit")
+                     help="Show camera counts by source and region from the store, then exit")
+    sel.add_argument("--import",  dest="import_path", metavar="GEOJSON",
+                     help="Seed the SQLite store from an existing geojson, then exit")
+    sel.add_argument("--export",  action="store_true",
+                     help="Export the store to --output geojson + summary.json, then exit (no scraping)")
+    sel.add_argument("--resolve-ipcamlive", action="store_true", dest="resolve_ipcamlive",
+                     help="Resolve existing ipcamlive:// placeholder streams in the store to real "
+                          "m3u8 URLs in place, re-export, then exit (no full re-scrape)")
+    sel.add_argument("--probe-image-hosts", action="store_true", dest="probe_image_hosts",
+                     help="Probe hosts of gated real-image cameras (direct_eligible=0); mark "
+                          "direct-displayable where the host actually serves images, re-export, "
+                          "then exit")
+    sel.add_argument("--probe-iframe-hosts", action="store_true", dest="probe_iframe_hosts",
+                     help="Probe hosts of iframe cameras for framing-blocking headers; mark "
+                          "direct-displayable where third-party framing is permitted, re-export, "
+                          "then exit")
+    sel.add_argument("--resolve-txdot", action="store_true", dest="resolve_txdot",
+                     help="Rewrite existing txdot:// placeholder cameras to the real "
+                          "its.txdot.gov snapshot API URL in place, re-export, then exit")
 
     # Optional exclusion
     parser.add_argument("--exclude", nargs="+", metavar="ALIAS",
@@ -250,57 +279,41 @@ def _list_plugins():
     print()
 
 
-def _show_stats(geojson_path: str):
-    """Load cameras.geojson and print a breakdown by source and region."""
+def _show_stats():
+    """Print a breakdown by source and region from the SQLite store."""
     _banner()
 
-    if not os.path.exists(geojson_path):
-        print(f"  [ERROR] File not found: {geojson_path}\n")
+    conn = store.connect()
+    total = conn.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]
+    if total == 0:
+        print("  [INFO] Store is empty. Run a scrape, or seed it with --import <geojson>.\n")
+        conn.close()
         return
 
-    with open(geojson_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    live_count = conn.execute("SELECT COUNT(*) FROM cameras WHERE stream_url != ''").fetchone()[0]
+    direct = conn.execute("SELECT COUNT(*) FROM cameras WHERE direct_eligible=1").fetchone()[0]
+    by_source = {r["source"]: r["n"] for r in conn.execute(
+        "SELECT source, COUNT(*) n FROM cameras GROUP BY source")}
+    by_source_live = {r["source"]: r["n"] for r in conn.execute(
+        "SELECT source, COUNT(*) n FROM cameras WHERE stream_url != '' GROUP BY source")}
+    conn.close()
 
-    features = data.get("features", [])
-    total = len(features)
-
-    # Count by source
-    by_source = {}
-    live_count = 0
-    for feat in features:
-        src = feat["properties"].get("source", "unknown")
-        by_source[src] = by_source.get(src, 0) + 1
-        if feat["properties"].get("streamUrl"):
-            live_count += 1
-
-    # Group road511_* sources under a USA subtotal
-    road511_total = sum(v for k, v in by_source.items() if k.startswith("road511_"))
-    usa_total = (
-        road511_total
-        + by_source.get("caltrans", 0)
-        + by_source.get("nyc_dot", 0)
-        + by_source.get("iowa_dot", 0)
-    )
-
-    # Country / region groups
+    # Country / region groups (opencctv_* rolls up under its own bucket)
     region_groups = {
-        "🌍  Global":       ["windy"],
-        "🇺🇸  USA":          [k for k in by_source if k.startswith("road511_")]
-                           + ["caltrans", "nyc_dot", "iowa_dot"],
-        "🇨🇦  Canada":       ["drivebc"],
-        "🇬🇧  United Kingdom": ["tfl_london"],
-        "🇸🇬  Singapore":    ["singapore_lta"],
-        "🇳🇿  New Zealand":  ["nzta"],
+        "🌍  Global":         ["windy"],
+        "🇺🇸  USA":            [k for k in by_source if k.startswith("road511_")]
+                             + ["caltrans", "nyc_dot", "iowa_dot"],
+        "🇨🇦  Canada":         ["drivebc"],
+        "🇬🇧  United Kingdom":  ["tfl_london"],
+        "🇸🇬  Singapore":      ["singapore_lta", "singapore"],
+        "🇳🇿  New Zealand":    ["nzta"],
+        "🛰  OpenCCTV":        [k for k in by_source if k.startswith("opencctv_")],
     }
 
-    print(f"  Dataset: {geojson_path}")
-    meta = data.get("metadata", {})
-    if meta.get("last_updated"):
-        print(f"  Last run: {meta['last_updated']}")
-    print()
     print(f"  {'TOTAL CAMERAS':<30} {total:>10,}")
     print(f"  {'Live video (HLS)':<30} {live_count:>10,}")
     print(f"  {'Static image only':<30} {total - live_count:>10,}")
+    print(f"  {'Direct-displayable':<30} {direct:>10,}")
     print()
     print(f"  {'─' * 50}")
     print(f"  {'REGION / SOURCE':<35} {'CAMERAS':>10}  {'LIVE':>6}")
@@ -310,21 +323,13 @@ def _show_stats(geojson_path: str):
         region_cams = sum(by_source.get(s, 0) for s in sources)
         if region_cams == 0:
             continue
-        region_live = sum(
-            1 for f in features
-            if f["properties"].get("source") in sources
-            and f["properties"].get("streamUrl")
-        )
+        region_live = sum(by_source_live.get(s, 0) for s in sources)
         print(f"\n  {region}")
         for src in sorted(sources, key=lambda s: -by_source.get(s, 0)):
             count = by_source.get(src, 0)
             if count == 0:
                 continue
-            src_live = sum(
-                1 for f in features
-                if f["properties"].get("source") == src
-                and f["properties"].get("streamUrl")
-            )
+            src_live = by_source_live.get(src, 0)
             live_str = f"{src_live:>6,}" if src_live else "     —"
             print(f"    {src:<33} {count:>8,}  {live_str}")
         region_live_str = f"{region_live:>6,}" if region_live else "     —"
@@ -337,6 +342,7 @@ def _show_stats(geojson_path: str):
         print(f"\n  Other")
         for src, count in sorted(other.items(), key=lambda x: -x[1]):
             print(f"    {src:<33} {count:>8,}")
+    print()
 
     print(f"\n  {'─' * 50}\n")
 
@@ -386,6 +392,183 @@ def _resolve_plugins(args) -> list:
 # ─────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────
+def _resolve_ipcamlive_store(output_path, compact_path, summary_path):
+    """In-place fix for cameras already stored as `ipcamlive://<alias>`: resolve
+    each to a real https m3u8 and UPDATE the row, then re-export. Lets the user
+    unlock these live streams without re-running the full opencctv harvester."""
+    from scrapers.ipcamlive_resolver import alias_from_url, resolve as resolve_ipcamlive
+
+    conn = store.connect()
+    rows = conn.execute(
+        "SELECT id, feed_url FROM cameras WHERE feed_url LIKE 'ipcamlive://%'"
+    ).fetchall()
+    if not rows:
+        log("No ipcamlive:// cameras in the store — nothing to resolve.", "WARN")
+        conn.close()
+        return
+
+    log(f"Resolving {len(rows):,} ipcamlive:// cameras to real m3u8...")
+    timeout = CONFIG.get("TIMEOUT", 15)
+    start = time.monotonic()
+
+    def _one(row):
+        return row["id"], resolve_ipcamlive(alias_from_url(row["feed_url"]), timeout)
+
+    resolved = 0
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = [ex.submit(_one, r) for r in rows]
+        for i, fut in enumerate(as_completed(futures), 1):
+            cid, m3u8 = fut.result()
+            if m3u8:
+                conn.execute(
+                    "UPDATE cameras SET feed_url=?, stream_url=?, feed_type='m3u8', "
+                    "direct_eligible=1 WHERE id=?", (m3u8, m3u8, cid))
+                resolved += 1
+            if i % 25 == 0 or i == len(rows):
+                log_progress("ipcamlive", i, len(rows), start)
+    conn.commit()
+    log(f"Resolved {resolved:,}/{len(rows):,} ipcamlive streams "
+        f"({len(rows) - resolved:,} offline/unresolvable).", "OK")
+
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    conn.close()
+    log(f"Re-exported {total:,} cameras → {output_path}", "OK")
+    log(f"Wrote compact → {compact_path}", "OK")
+
+
+def _probe_image_hosts_store(output_path, compact_path, summary_path):
+    """In-place fix: opencctv marks some cameras with a real image URL as
+    non-direct (conservative default). Probe each origin host once — not
+    every camera — and flip `direct_eligible` for every camera on a host that
+    actually serves images without a referer/hotlink check."""
+    from scrapers.host_prober import probe_image_host, probe_hosts
+
+    conn = store.connect()
+    rows = conn.execute(
+        "SELECT id, feed_url, origin_host FROM cameras WHERE "
+        "(stream_url IS NULL OR stream_url='') AND direct_eligible=0 "
+        "AND feed_url LIKE 'http%' AND feed_type IN ('image','mjpeg')"
+    ).fetchall()
+    if not rows:
+        log("No gated image cameras found — nothing to probe.", "WARN")
+        conn.close()
+        return
+
+    by_host = {}
+    for r in rows:
+        by_host.setdefault(r["origin_host"], []).append(r)
+
+    log(f"Probing {len(by_host):,} hosts covering {len(rows):,} gated image cameras...")
+    host_samples = {host: [r["feed_url"] for r in cams[:5]] for host, cams in by_host.items()}
+    verdicts = probe_hosts(host_samples, probe_image_host)
+
+    recovered = 0
+    for host, cams in by_host.items():
+        if verdicts.get(host):
+            conn.executemany("UPDATE cameras SET direct_eligible=1 WHERE id=?",
+                              [(c["id"],) for c in cams])
+            recovered += len(cams)
+    conn.commit()
+
+    passed = sum(1 for v in verdicts.values() if v)
+    log(f"Hosts: {passed:,}/{len(by_host):,} passed the image probe.", "OK")
+    log(f"Recovered {recovered:,}/{len(rows):,} cameras (now direct-displayable).", "OK")
+
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    conn.close()
+    log(f"Re-exported {total:,} cameras → {output_path}", "OK")
+    log(f"Wrote compact → {compact_path}", "OK")
+
+
+def _probe_iframe_hosts_store(output_path, compact_path, summary_path):
+    """In-place fix: flip `direct_eligible` for iframe cameras whose host
+    actually permits third-party framing (no X-Frame-Options/frame-ancestors
+    block). Hosts that block framing are left greyed out — better than a
+    silently blank iframe panel."""
+    from scrapers.host_prober import probe_iframe_host, probe_hosts
+
+    conn = store.connect()
+    rows = conn.execute(
+        "SELECT id, feed_url, origin_host FROM cameras WHERE "
+        "(stream_url IS NULL OR stream_url='') AND direct_eligible=0 "
+        "AND feed_type='iframe'"
+    ).fetchall()
+    if not rows:
+        log("No gated iframe cameras found — nothing to probe.", "WARN")
+        conn.close()
+        return
+
+    by_host = {}
+    for r in rows:
+        by_host.setdefault(r["origin_host"], []).append(r)
+
+    log(f"Probing {len(by_host):,} hosts covering {len(rows):,} iframe cameras...")
+    host_samples = {host: cams[0]["feed_url"] for host, cams in by_host.items()}
+    verdicts = probe_hosts(host_samples, probe_iframe_host)
+
+    recovered = 0
+    for host, cams in by_host.items():
+        if verdicts.get(host):
+            conn.executemany("UPDATE cameras SET direct_eligible=1 WHERE id=?",
+                              [(c["id"],) for c in cams])
+            recovered += len(cams)
+    conn.commit()
+
+    passed = sum(1 for v in verdicts.values() if v)
+    log(f"Hosts: {passed:,}/{len(by_host):,} permit third-party framing.", "OK")
+    log(f"Recovered {recovered:,}/{len(rows):,} cameras (now embeddable).", "OK")
+
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    conn.close()
+    log(f"Re-exported {total:,} cameras → {output_path}", "OK")
+    log(f"Wrote compact → {compact_path}", "OK")
+
+
+def _resolve_txdot_store(output_path, compact_path, summary_path):
+    """In-place fix: rewrite txdot:// placeholders to the real snapshot API URL
+    (a pure string transform, no network calls — see txdot_resolver.py) and
+    mark them direct-eligible. The frontend's TxdotSnapshot component does the
+    actual fetch+decode (direct, falling back to the local dev proxy — the API
+    sends no CORS header at all)."""
+    from urllib.parse import urlparse
+    from scrapers.txdot_resolver import resolve_txdot_url, _API_URL
+
+    conn = store.connect()
+    rows = conn.execute(
+        "SELECT id, feed_url FROM cameras WHERE feed_url LIKE 'txdot://%'"
+    ).fetchall()
+    if not rows:
+        log("No txdot:// cameras in the store — nothing to resolve.", "WARN")
+        conn.close()
+        return
+
+    host = urlparse(_API_URL).hostname or ""
+    resolved = 0
+    for row in rows:
+        api_url = resolve_txdot_url(row["feed_url"])
+        if api_url:
+            conn.execute(
+                "UPDATE cameras SET feed_url=?, feed_type='txdot-json', "
+                "direct_eligible=1, origin_host=? WHERE id=?",
+                (api_url, host, row["id"]))
+            resolved += 1
+    conn.commit()
+    log(f"Resolved {resolved:,}/{len(rows):,} txdot:// cameras to the snapshot API.", "OK")
+
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    conn.close()
+    log(f"Re-exported {total:,} cameras → {output_path}", "OK")
+    log(f"Wrote compact → {compact_path}", "OK")
+
+
 def main():
     args = _parse_args()
 
@@ -393,13 +576,56 @@ def main():
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     output_path = args.output or os.path.join(scripts_dir, "..", "public", "cameras.geojson")
     output_path = os.path.normpath(output_path)
+    summary_path = os.path.join(os.path.dirname(output_path), "summary.json")
+    compact_path = os.path.join(os.path.dirname(output_path), "cameras.min.json")
 
     if args.list:
         _list_plugins()
         return
 
     if args.stats:
-        _show_stats(output_path)
+        _show_stats()
+        return
+
+    if args.import_path:
+        _banner()
+        conn = store.connect()
+        log(f"Importing {args.import_path} into the store...")
+        n = store.import_geojson(conn, args.import_path)
+        log(f"Store now holds {n:,} cameras.", "OK")
+        conn.close()
+        return
+
+    if args.resolve_ipcamlive:
+        _banner()
+        _resolve_ipcamlive_store(output_path, compact_path, summary_path)
+        return
+
+    if args.probe_image_hosts:
+        _banner()
+        _probe_image_hosts_store(output_path, compact_path, summary_path)
+        return
+
+    if args.probe_iframe_hosts:
+        _banner()
+        _probe_iframe_hosts_store(output_path, compact_path, summary_path)
+        return
+
+    if args.resolve_txdot:
+        _banner()
+        _resolve_txdot_store(output_path, compact_path, summary_path)
+        return
+
+    if args.export:
+        _banner()
+        conn = store.connect()
+        n = store.export_geojson(conn, output_path)
+        store.export_compact(conn, compact_path)
+        store.export_summary(conn, summary_path)
+        conn.close()
+        log(f"Exported {n:,} cameras → {output_path}", "OK")
+        log(f"Wrote compact → {compact_path}", "OK")
+        log(f"Wrote summary → {summary_path}", "OK")
         return
 
     _banner()
@@ -438,15 +664,15 @@ def main():
     print(f"  Parallel : {'yes' if args.parallel else 'no'}")
     print()
 
-    # ── Load existing ──────────────────────────────────────
-    if mode != "fresh":
-        log(f"Loading existing data from {output_path}...")
-        existing = load_geojson(output_path)
-        existing_features = existing.get("features", [])
-        log(f"Found {len(existing_features):,} existing cameras.", "OK")
-    else:
-        existing_features = []
-        log("Fresh mode — ignoring existing data.", "WARN")
+    # ── Open store ─────────────────────────────────────────
+    conn = store.connect()
+    store_stats    = store.stats(conn)
+    existing_count = store_stats["total"]
+    log(f"Store holds {existing_count:,} cameras before this run.", "OK")
+
+    # Prior per-source counts let plugins self-calibrate their progress-bar ETA
+    # target to what the store already holds (a re-run yields ~the same count).
+    CONFIG["_PRIOR_SOURCE_COUNTS"] = store_stats.get("by_source", {})
 
     # ── Run plugins ────────────────────────────────────────
     plugin_results = {}
@@ -474,24 +700,40 @@ def main():
                 plugin_results[alias] = features
                 log(f"Plugin '{alias}' returned {len(features):,} cameras", "OK")
 
-    # ── Merge ──────────────────────────────────────────────
-    _divider("Merging results")
+    # ── Merge into store ───────────────────────────────────
+    # commit=False on every step + one conn.commit() at the end makes this a
+    # single atomic transaction: if the process is killed anywhere in here
+    # (e.g. a cancelled sync), SQLite rolls the whole batch back and the store
+    # is left exactly as it was before the run — never a partial delete/insert.
+    _divider("Merging results into store")
 
     all_new_features = []
     for features in plugin_results.values():
         all_new_features.extend(features)
 
-    merged, added, updated, removed = merge_features(
-        existing_features, all_new_features, mode, sources_being_run
-    )
+    removed = 0
+    if mode == "fresh":
+        removed = store.clear_all(conn, commit=False)
+        log("Fresh mode — cleared existing store.", "WARN")
+    elif mode == "replace-source":
+        removed = store.delete_sources(conn, sources_being_run, commit=False)
+        log(f"replace-source — dropped {removed:,} stale cameras from: {', '.join(sources_being_run)}", "OK")
 
-    per_source_counts = {}
-    for feat in merged:
-        src = feat["properties"].get("source", "unknown")
-        per_source_counts[src] = per_source_counts.get(src, 0) + 1
+    added, updated = store.upsert_features(conn, all_new_features, commit=False)
 
-    # ── Save ───────────────────────────────────────────────
-    save_geojson(output_path, merged, sorted(per_source_counts), per_source_counts)
+    deduped = store.dedupe_prefer_native(conn, commit=False)
+    if deduped:
+        log(f"Dedupe — dropped {deduped:,} opencctv cameras already covered by native sources.", "OK")
+
+    conn.commit()
+
+    # ── Export artifacts ───────────────────────────────────
+    _divider("Exporting geojson + compact + summary")
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    per_source_counts = store.stats(conn)["by_source"]
+    conn.close()
 
     # ── Summary ────────────────────────────────────────────
     elapsed    = time.time() - start_time
@@ -500,13 +742,14 @@ def main():
     print("\n" + "═" * 65)
     print("  ✓  Pipeline Complete")
     print("═" * 65)
-    print(f"  Total cameras  : {len(merged):,}")
+    print(f"  Total cameras  : {total:,}")
     print(f"  Added          : {added:,}")
     print(f"  Updated        : {updated:,}")
     if removed:
         print(f"  Removed (stale): {removed:,}")
     print(f"  Elapsed        : {mins}m {secs}s")
     print(f"  Output         : {output_path}")
+    print(f"  Summary        : {summary_path}")
     if plugin_errors:
         print(f"\n  Failed plugins : {', '.join(plugin_errors)}")
         for alias, err in plugin_errors.items():
