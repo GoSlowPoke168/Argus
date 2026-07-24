@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer } from '@deck.gl/layers';
 import MapGL, { Source, Layer } from 'react-map-gl/maplibre';
-import type { MapMouseEvent } from 'maplibre-gl';
+import type { MapMouseEvent, ExpressionSpecification } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown, Settings, Shuffle, Filter, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -34,38 +34,65 @@ const scrollbarStyles = `
   }
 `;
 
-function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: number; onFallback?: () => void }) {
+function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cacheBust?: number; onFallback?: () => void; proxyBase?: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  // Escalation: play direct first; on a fatal error, retry once through the
+  // local CORS proxy (if available); only then fall back to a static image.
+  const [useProxy, setUseProxy] = useState(false);
+  const canProxy = !!proxyBase;
+
+  // A brand-new camera (url change) always starts a fresh direct attempt.
+  useEffect(() => { setUseProxy(false); }, [url]);
 
   useEffect(() => {
     if (!videoRef.current) return;
 
-    // Direct MP4 — use native video src
+    const via = (u: string) => (useProxy && proxyBase ? `${proxyBase}${encodeURIComponent(u)}` : u);
+    // First failure escalates to the proxy; a failure while already proxied
+    // (or with no proxy available) is the real end → static fallback.
+    const escalate = () => {
+      if (!useProxy && canProxy) {
+        console.log('[Argus] Stream failed direct — retrying via local proxy.');
+        setUseProxy(true);
+      } else {
+        console.log('[Argus] Stream unavailable — falling back to static image.');
+        onFallback?.();
+      }
+    };
+
+    // Direct MP4 — native video src (native <video> handles progressive CORS).
     if (url.toLowerCase().includes('.mp4')) {
-      const sep = url.includes('?') ? '&' : '?';
-      videoRef.current.src = cacheBust ? `${url}${sep}_t=${cacheBust}` : url;
+      const base = via(url);
+      const sep = base.includes('?') ? '&' : '?';
+      videoRef.current.src = cacheBust ? `${base}${sep}_t=${cacheBust}` : base;
+      videoRef.current.onerror = () => escalate();
       videoRef.current.play().catch(e => console.log('Autoplay prevented', e));
-      return;
+      return () => { if (videoRef.current) videoRef.current.onerror = null; };
     }
 
     let hls: Hls | null = null;
 
     if (Hls.isSupported()) {
       hls = new Hls({ enableWorker: false });
-      hls.loadSource(url);
+      // On the proxy retry, load the playlist *through* the proxy — the proxy
+      // rewrites every segment/variant URI to an absolute proxied URL, so all
+      // of hls.js's follow-up fetches are CORS-enabled too.
+      hls.loadSource(via(url));
       hls.attachMedia(videoRef.current);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
       });
-      // Detect CORS blocks or dead streams and switch to static image fallback
+      // Detect CORS blocks or dead streams and escalate (proxy → static).
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (data.fatal) {
-          console.log(`[Argus] Stream ${data.details} - falling back to static image.`);
+          console.log(`[Argus] Stream ${data.details}${useProxy ? ' (via proxy)' : ''}`);
           hls?.destroy();
-          onFallback?.();
+          escalate();
         }
       });
     } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS: it fetches segments itself, so the proxy can't rewrite
+      // them — direct-only, straight to fallback on error.
       videoRef.current.src = url;
       videoRef.current.addEventListener('loadedmetadata', () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
@@ -76,12 +103,13 @@ function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: nu
     }
 
     return () => { if (hls) hls.destroy(); };
-  }, [url]);
+  }, [url, useProxy, proxyBase]);
 
   useEffect(() => {
     if (!videoRef.current || !url.toLowerCase().includes('.mp4')) return;
-    const sep = url.includes('?') ? '&' : '?';
-    videoRef.current.src = cacheBust ? `${url}${sep}_t=${cacheBust}` : url;
+    const base = (useProxy && proxyBase) ? `${proxyBase}${encodeURIComponent(url)}` : url;
+    const sep = base.includes('?') ? '&' : '?';
+    videoRef.current.src = cacheBust ? `${base}${sep}_t=${cacheBust}` : base;
     videoRef.current.play().catch(e => console.log('Autoplay prevented', e));
   }, [cacheBust]);
 
@@ -96,6 +124,58 @@ function HlsPlayer({ url, cacheBust, onFallback }: { url: string; cacheBust?: nu
       loop
     />
   );
+}
+
+// TxDOT's snapshot API (its.txdot.gov) returns the image base64-embedded in a
+// JSON body, and sends no Access-Control-Allow-Origin header at all — a
+// browser fetch() is CORS-blocked everywhere, unlike an <img src> which
+// doesn't enforce CORS for basic display. Direct-first (in case that ever
+// changes), then the local proxy (dev-only, adds ACAO:*); with neither
+// working, gracefully fall back like any other unavailable feed.
+function TxdotSnapshot({ url, cacheBust, onFallback, proxyBase }: { url: string; cacheBust?: number; onFallback?: () => void; proxyBase?: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSrc(null);
+
+    const tryFetch = async (fetchUrl: string) => {
+      const resp = await fetch(fetchUrl);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      if (!data.snippet) throw new Error('no snippet in response');
+      return `data:image/jpeg;base64,${data.snippet}`;
+    };
+
+    (async () => {
+      try {
+        const dataUrl = await tryFetch(url);
+        if (!cancelled) setSrc(dataUrl);
+      } catch {
+        if (!proxyBase) {
+          if (!cancelled) onFallback?.();
+          return;
+        }
+        try {
+          const dataUrl = await tryFetch(`${proxyBase}${encodeURIComponent(url)}`);
+          if (!cancelled) setSrc(dataUrl);
+        } catch {
+          if (!cancelled) onFallback?.();
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [url, cacheBust, proxyBase]);
+
+  if (!src) {
+    return (
+      <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm z-10">
+        <div className="w-8 h-8 border-2 border-white/10 border-t-[#00e5ff] rounded-full animate-spin" />
+      </div>
+    );
+  }
+  return <img src={src} alt="" className="w-full h-full object-contain" />;
 }
 
 const INITIAL_VIEW_STATE = {
@@ -126,12 +206,70 @@ interface CameraProperties {
   highway?: string;
   route?: string;
   source?: string;
+  directEligible?: boolean;
+  updateRate?: number;
 }
 
 interface CameraFeature {
   type: 'Feature';
   geometry: { type: 'Point'; coordinates: [number, number] };
   properties: CameraProperties;
+}
+
+// Compact parallel-array payload emitted by scripts/store.py:export_compact.
+// Parallel arrays + dictionary-encoded source/country keep the dataset small
+// (~6MB gzipped @200k) and let deck.gl render from flat arrays without
+// materializing one JS object per camera.
+interface CompactData {
+  count: number;
+  srcDict: string[];
+  ccDict: string[];
+  ftDict?: string[];
+  lon: number[]; lat: number[]; de: number[]; ur: number[];
+  id: string[]; name: string[]; feed: string[]; stream: string[];
+  city: string[]; src: number[]; cc: number[]; ft?: number[]; route: string[];
+}
+
+// Rebuild a single CameraFeature (the shape the whole UI expects) from the
+// compact arrays at index i — used on hover/click/random, never for the full set.
+function camAt(d: CompactData, i: number): CameraFeature {
+  const stream = d.stream[i];
+  return {
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [d.lon[i], d.lat[i]] },
+    properties: {
+      id: d.id[i],
+      name: d.name[i],
+      type: '',
+      city: d.city[i],
+      country: d.ccDict[d.cc[i]],
+      feedUrl: d.feed[i],
+      streamUrl: stream || undefined,
+      feedType: (d.ftDict && d.ft) ? (d.ftDict[d.ft[i]] || '') : '',
+      source: d.srcDict[d.src[i]],
+      route: d.route[i] || undefined,
+      directEligible: d.de[i] === 1,
+      updateRate: d.ur[i] || undefined,
+    },
+  };
+}
+
+// Sources with strict refresh ToS (satellite / weather-sat imagery updates
+// every ~10 min). Everything else honors its harvested updateRate under a
+// 60s global floor. Limits were uncertain, so this is conservative + editable.
+// Local dev-only control server (scripts/server.py). Absent on the deployed static site.
+const SYNC_SERVER = 'http://localhost:8787';
+// CORS pass-through proxy exposed by that same local server. Streams whose origin
+// sends no Access-Control-Allow-Origin can be played by routing hls.js's fetches
+// through here. Only used when the server is reachable (syncServerUp === true);
+// on the deployed static site it's never available and streams fall back to static.
+const PROXY_BASE = `${SYNC_SERVER}/api/proxy?url=`;
+
+const SATELLITE_SOURCES = ['goes-satellite', 'faa-weathercams', 'goes-satellite', 'satellite'];
+function refreshIntervalMs(cam: CameraFeature): number {
+  const src = (cam.properties.source || '').toLowerCase();
+  if (SATELLITE_SOURCES.some(s => src.includes(s))) return 600_000;
+  return Math.max(cam.properties.updateRate || 0, 60_000);
 }
 
 const COUNTRY_NAMES: Record<string, string> = {
@@ -143,44 +281,8 @@ const COUNTRY_NAMES: Record<string, string> = {
   CH: 'Switzerland', ZA: 'South Africa', EG: 'Egypt', ID: 'Indonesia', TH: 'Thailand',
 };
 
-// Domains confirmed to serve embeddable images without hotlink protection
-const WORKING_IMAGE_DOMAINS = [
-  // ── Existing dedicated plugins ──────────────────────────────────────────
-  'drivebc.ca',           // DriveBC — British Columbia
-  'cwwp2.dot.ca.gov',    // Caltrans — California
-  'images.data.gov.sg',  // Singapore LTA
-  'imgproxy.windy.com',  // Windy Webcams
-  'webcams.nyctmc.org',  // NYC DOT
-  'nzta.govt.nz',        // New Zealand NZTA
-  'tfl.gov.uk',          // London TfL
-  'amazonaws.com',       // S3-hosted feeds (TfL, Iowa, SC, etc.)
-  'cloudfront.net',      // CloudFront CDN
-
-  // ── Road511 USA state DOT domains ───────────────────────────────────────
-  'fl511.com',           // Florida (4,136 cameras)
-  'udottraffic.utah.gov',// Utah (2,035 cameras)
-  '511ny.org',           // New York state (1,702 cameras)
-  'wsdot.wa.gov',        // Washington (1,452 cameras)
-  'carsprogram.org',     // Indiana / Colorado / Kansas (CARS camera network)
-  'tripcheck.com',       // Oregon TripCheck
-  'skyvdn.com',          // Iowa / South Carolina DOT CDN
-  'tnsnapshots.com',     // Tennessee (668 cameras)
-  'az511.com',           // Arizona (643 cameras)
-  'idrivearkansas.com',  // Arkansas (545 cameras)
-  'iowadot.gov',         // Iowa DOT (atmsqf.iowadot.gov RWIS snapshots)
-  'dot.state.oh.us',     // Ohio (itscameras.dot.state.oh.us)
-  'nebraska.gov',        // Nebraska (dot511.nebraska.gov)
-  'deldot.gov',          // Delaware (video.deldot.gov)
-  'kcscout.net',         // Kansas City Scout cameras
-  'trimarc.org',         // Kentucky (Louisville TRIMARC)
-  'wyoroad.info',        // Wyoming (www.wyoroad.info)
-  'dot.nd.gov',          // North Dakota
-  'streamlock.net',      // Massachusetts (Wowza streaming)
-  'iteris-atis.com',     // South Dakota
-  'trafficnz.info',      // New Zealand (trafficnz.info highway cameras)
-];
-
-// Domains known to support CORS headers for image fingerprinting
+// Domains known to support CORS headers for image fingerprinting (used to
+// decide crossOrigin="anonymous" so we can hash pixels to detect real updates).
 const CORS_ENABLED_DOMAINS = [
   'imgproxy.windy.com',
   'amazonaws.com',
@@ -189,14 +291,22 @@ const CORS_ENABLED_DOMAINS = [
   'nzta.govt.nz'
 ];
 
-function isFeedWorking(feedUrl: string, streamUrl?: string): boolean {
-  // A feed works if EITHER the image URL is on a known-good domain,
-  // OR there is a valid stream URL (HLS etc.) available.
-  if (streamUrl && streamUrl.trim()) return true;
-  if (!feedUrl) return false;
-  return WORKING_IMAGE_DOMAINS.some(d => feedUrl.includes(d));
+// Whether a selected camera's feed can be displayed. Replaces the old hardcoded
+// domain allowlist: the scraper now stores a per-camera `directEligible` flag
+// (opencctv's force_direct, or the legacy allowlist for native sources), so this
+// scales to thousands of hosts. A live stream always counts as displayable.
+function isFeedWorking(cam: CameraFeature): boolean {
+  if (cam.properties.streamUrl && cam.properties.streamUrl.trim()) return true;
+  return !!cam.properties.directEligible;
 }
 
+
+// MapLibre filter expression: does this globe feature have a live stream?
+// Reused across the 3D layer's paint properties so live/static styling stays in sync.
+// Annotated (not inferred) so it stays a valid ExpressionSpecification tuple rather
+// than widening to string[][], which the paint prop types reject.
+const GLOBE_IS_LIVE: ExpressionSpecification =
+  ['all', ['has', 'streamUrl'], ['!=', ['get', 'streamUrl'], '']];
 
 function shouldRetryWithProxy(url: string): boolean {
   // Caltrans cameras may need retry with proxy if direct load fails
@@ -216,19 +326,39 @@ function formatLocation(cam: CameraFeature): string {
   return `${city} · ${countryName}`;
 }
 
+// Parse a scraper "[PROGRESS] <plugin> [bar] NN% · a/b · eta X" line (emitted by
+// scripts/scrapers/utils.py:log_progress) into the fields the sync bar needs.
+// Returns null for any non-progress log line.
+function parseProgress(line: string): { plugin: string; pct: number; eta: string } | null {
+  if (!line || !line.includes('[PROGRESS]')) return null;
+  const plugin = line.match(/\[PROGRESS\]\s+(\S+)/)?.[1] ?? '';
+  const pct = line.match(/(\d+)%/)?.[1];
+  const eta = line.match(/eta\s+(\S+)/)?.[1] ?? '—';
+  if (pct === undefined) return null;
+  return { plugin, pct: Math.min(100, Math.max(0, parseInt(pct, 10))), eta };
+}
+
 function App() {
-  const [cameras, setCameras] = useState<CameraFeature[]>([]);
+  const [data, setData] = useState<CompactData | null>(null);
   const [selectedCamera, setSelectedCamera] = useState<CameraFeature | null>(null);
   const [hovered, setHovered] = useState<CameraFeature | null>(null);
+  // Last hovered camera index, tracked in a ref so per-pixel hover events only touch
+  // React state when the hovered camera actually changes.
+  const hoveredIdxRef = useRef(-1);
+  // Coordinate HUD is updated by writing textContent directly (no state -> no re-render).
+  const coordRef = useRef<HTMLSpanElement | null>(null);
   const [loading, setLoading] = useState(true);
   const [imgCacheBust, setImgCacheBust] = useState(Date.now());
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [imgLoaded, setImgLoaded] = useState(false);
   const [isHudMinimized, setIsHudMinimized] = useState(false);
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
-  const [mouseCoords, setMouseCoords] = useState<[number, number] | null>(null);
   const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
   const [hlsFailed, setHlsFailed] = useState(false);
+  // Set when a TxdotSnapshot fetch fails direct AND via the local proxy (or no
+  // proxy is available) — there's no separate static-image URL to fall back
+  // to for these, so this gates the whole panel to the "Feed Unavailable" card.
+  const [staticFeedFailed, setStaticFeedFailed] = useState(false);
   const [imgLastLoaded, setImgLastLoaded] = useState<Date | null>(null);
   const [lastImageHash, setLastImageHash] = useState<string | null>(null);
   const [use24Hour, setUse24Hour] = useState(false);
@@ -240,6 +370,17 @@ function App() {
   const [filterSearch, setFilterSearch] = useState('');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Data Sync (local control server, dev-only) ──
+  const [syncServerUp, setSyncServerUp] = useState<boolean | null>(null);
+  const [syncTarget, setSyncTarget] = useState<string | null>(null); // running target, or null
+  const [syncLog, setSyncLog] = useState<string[]>([]);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [syncSummary, setSyncSummary] = useState<string | null>(null);
+  // Latest progress parsed from a scraper [PROGRESS] line, or null before the first one.
+  const [syncProgress, setSyncProgress] = useState<{ plugin: string; pct: number; eta: string } | null>(null);
+  const syncLogRef = useRef<HTMLDivElement | null>(null);
+  const syncAbortRef = useRef<AbortController | null>(null);
 
   const formatTime = (date: Date) => {
     return date.toLocaleTimeString([], {
@@ -263,12 +404,11 @@ function App() {
   }, [is3D]);
 
   const openRandomCamera = () => {
-    const pool = filteredCameras.length > 0 ? filteredCameras : cameras;
-    if (pool.length === 0) return;
-    
-    const randomIndex = Math.floor(Math.random() * pool.length);
-    const cam = pool[randomIndex];
+    if (!data || filteredIndices.length === 0) return;
+    const i = filteredIndices[Math.floor(Math.random() * filteredIndices.length)];
+    const cam = camAt(data, i);
     setSelectedCamera(cam);
+    setHlsFailed(false);
 
     if (cam.geometry.coordinates[0] && cam.geometry.coordinates[1]) {
       setViewState(prev => ({
@@ -280,66 +420,191 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    fetch('/cameras.geojson')
+  // Load (or reload) the compact dataset. `bust` re-fetches past the cache after a sync.
+  const loadData = (bust = false) => {
+    setLoading(true);
+    fetch(bust ? `/cameras.min.json?_t=${Date.now()}` : '/cameras.min.json')
       .then(r => r.json())
-      .then(data => { setCameras(data.features || []); setLoading(false); })
+      .then((d: CompactData) => {
+        // Pack coordinates into typed arrays: smaller footprint and a zero-copy upload
+        // path into deck.gl's position buffer.
+        d.lon = Float32Array.from(d.lon) as unknown as number[];
+        d.lat = Float32Array.from(d.lat) as unknown as number[];
+        setData(d);
+        setLoading(false);
+      })
       .catch(() => setLoading(false));
+  };
+
+  useEffect(() => { loadData(); }, []);
+
+  // Probe the local control server once on mount so the stream proxy is known to
+  // be available while viewing a camera (Settings closed). Re-probed on open below.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${SYNC_SERVER}/api/health`)
+      .then(r => (r.ok ? r.json() : Promise.reject()))
+      .then(() => { if (!cancelled) setSyncServerUp(true); })
+      .catch(() => { if (!cancelled) setSyncServerUp(false); });
+    return () => { cancelled = true; };
   }, []);
+
+  // Probe the local control server whenever Settings opens — the Data Sync
+  // controls only work when `python scripts/server.py` is running locally.
+  useEffect(() => {
+    if (!isSettingsOpen) return;
+    let cancelled = false;
+    fetch(`${SYNC_SERVER}/api/health`)
+      .then(r => (r.ok ? r.json() : Promise.reject()))
+      .then(() => { if (!cancelled) setSyncServerUp(true); })
+      .catch(() => { if (!cancelled) setSyncServerUp(false); });
+    return () => { cancelled = true; };
+  }, [isSettingsOpen]);
+
+  // Reset the sync UI back to the three idle buttons.
+  const resetSync = () => {
+    setSyncStatus('idle'); setSyncLog([]); setSyncSummary(null); setSyncTarget(null);
+    setSyncProgress(null);
+  };
+
+  // Abort a run in progress — the fetch aborts, which closes the stream and the
+  // server terminates the scraper subprocess on the broken pipe.
+  const cancelScrape = () => { syncAbortRef.current?.abort(); };
+
+  // Kick off a scrape and consume the server's newline-delimited JSON progress stream.
+  const runScrape = async (target: string) => {
+    const ctrl = new AbortController();
+    syncAbortRef.current = ctrl;
+    setSyncTarget(target);
+    setSyncStatus('running');
+    setSyncLog([]);
+    setSyncSummary(null);
+    setSyncProgress(null);
+    try {
+      const res = await fetch(`${SYNC_SERVER}/api/scrape`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+        signal: ctrl.signal,
+      });
+      if (res.status === 409) {
+        setSyncStatus('error'); setSyncSummary('A sync is already running.'); setSyncTarget(null); return;
+      }
+      if (!res.ok || !res.body) throw new Error('server error');
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const l of lines) {
+          if (!l.trim()) continue;
+          let ev: { type: string; line?: string; message?: string; code?: number; before?: number; after?: number; delta?: number };
+          try { ev = JSON.parse(l); } catch { continue; }
+          if (ev.type === 'log') {
+            const prog = parseProgress(ev.line as string);
+            if (prog) {
+              // Progress lines drive the bar instead of cluttering the raw log.
+              setSyncProgress(prog);
+            } else {
+              setSyncLog(prev => [...prev.slice(-400), ev.line as string]);
+            }
+          } else if (ev.type === 'done') {
+            const d = ev.delta;
+            const sign = d != null && d >= 0 ? '+' : '';
+            setSyncSummary(
+              `${(ev.before ?? 0).toLocaleString()} → ${(ev.after ?? 0).toLocaleString()}` +
+              (d != null ? ` (${sign}${d.toLocaleString()})` : '')
+            );
+            if (ev.code === 0) setSyncProgress(p => (p ? { ...p, pct: 100, eta: '0s' } : p));
+            setSyncStatus(ev.code === 0 ? 'done' : 'error');
+          } else if (ev.type === 'error') {
+            setSyncSummary(ev.message ?? 'Scraper error'); setSyncStatus('error');
+          }
+        }
+      }
+      setSyncTarget(null);
+    } catch {
+      if (ctrl.signal.aborted) {
+        resetSync();  // user cancelled — return cleanly to the idle buttons
+      } else {
+        setSyncStatus('error');
+        setSyncSummary('Lost connection to the local server.');
+        setSyncTarget(null);
+      }
+    }
+  };
+
+  // Keep the sync log pinned to the newest line.
+  useEffect(() => {
+    if (syncLogRef.current) syncLogRef.current.scrollTop = syncLogRef.current.scrollHeight;
+  }, [syncLog]);
 
   const mapStyle = useMemo(() => "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json", []);
 
-  const getCountryName = (props: any) => {
-    const rawCountry = (props.country || '').toUpperCase();
-    const source = (props.source || '').toLowerCase();
-    const region = (props.region || '').toUpperCase();
-
-    // Consolidated US Sources
-    const isUS = rawCountry === 'US' || 
-                 rawCountry === 'USA' || 
-                 source.includes('caltrans') || 
-                 source.includes('road511') || 
-                 source.includes('nyc_dot') || 
-                 source.includes('iowa_dot');
-
+  // Display country name from a raw code + source (US sources consolidate).
+  const countryNameFor = (code: string, source: string) => {
+    const rawCountry = (code || '').toUpperCase();
+    const src = (source || '').toLowerCase();
+    const isUS = rawCountry === 'US' || rawCountry === 'USA' ||
+                 src.includes('caltrans') || src.includes('road511') ||
+                 src.includes('nyc_dot') || src.includes('iowa_dot');
     if (isUS) return 'United States';
-    
-    const key = (props.country || props.region || 'unknown').toUpperCase();
-    
-    // Check manual overrides first
+    const key = (code || 'unknown').toUpperCase();
     if (MANUAL_OVERRIDES[key]) return MANUAL_OVERRIDES[key];
-    
-    // Use dynamic ISO lookup
     const resolved = countries.getName(key, 'en');
     if (resolved) return resolved;
-
     return key.length <= 3 ? key : 'Global Sector';
   };
 
+  // Country -> display name, computed once over the compact arrays (no per-camera objects).
   const countryStats = useMemo(() => {
+    if (!data) return [] as [string, number][];
     const stats: Record<string, number> = {};
-    cameras.forEach(c => {
-      const name = getCountryName(c.properties);
+    for (let i = 0; i < data.count; i++) {
+      const name = countryNameFor(data.ccDict[data.cc[i]], data.srcDict[data.src[i]]);
       stats[name] = (stats[name] || 0) + 1;
-    });
+    }
     return Object.entries(stats).sort((a, b) => b[1] - a[1]);
-  }, [cameras]);
+  }, [data]);
 
-  const filteredCameras = useMemo(() => {
-    if (filterCountries.length === 0) return cameras;
-    return cameras.filter(c => filterCountries.includes(getCountryName(c.properties)));
-  }, [cameras, filterCountries]);
+  // Indices passing the active country filter — the render set for both map paths.
+  const filteredIndices = useMemo(() => {
+    if (!data) return [] as number[];
+    const idx: number[] = [];
+    const active = new Set(filterCountries);
+    for (let i = 0; i < data.count; i++) {
+      if (active.size === 0 ||
+          active.has(countryNameFor(data.ccDict[data.cc[i]], data.srcDict[data.src[i]]))) {
+        idx.push(i);
+      }
+    }
+    return idx;
+  }, [data, filterCountries]);
 
-  const cameraMap = useMemo(() => {
-    const m = new window.Map<string, CameraFeature>();
-    filteredCameras.forEach(c => m.set(c.properties.id, c));
+  // GeoJSON source for the 3D globe path — built only when 3D is active so the
+  // 2D default never materializes 100k+ features.
+  const camerasGeoJson = useMemo(() => {
+    if (!data || !is3D) return { type: 'FeatureCollection', features: [] as any[] };
+    return {
+      type: 'FeatureCollection',
+      features: filteredIndices.map(i => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [data.lon[i], data.lat[i]] },
+        properties: { id: data.id[i], streamUrl: data.stream[i] },
+      })),
+    };
+  }, [data, is3D, filteredIndices]);
+
+  // id -> array index, only needed to resolve clicks/hovers on the 3D globe layer.
+  const idToIdx = useMemo(() => {
+    const m = new window.Map<string, number>();
+    if (data && is3D) for (let i = 0; i < data.count; i++) m.set(data.id[i], i);
     return m;
-  }, [filteredCameras]);
-
-  const camerasGeoJson = useMemo(() => ({
-    type: 'FeatureCollection',
-    features: filteredCameras
-  }), [filteredCameras]);
+  }, [data, is3D]);
 
   const hoveredGeoJson = useMemo(() => ({
     type: 'FeatureCollection',
@@ -351,21 +616,26 @@ function App() {
     features: selectedCamera ? [selectedCamera] : []
   }), [selectedCamera]);
 
-  // Auto-refresh every 15s
+  // Auto-refresh the selected camera's image at a rate that respects the
+  // source's limits: max(harvested updateRate, 60s floor), or 10 min for
+  // satellite/weather sources. Only the selected feed polls; nothing else does.
   useEffect(() => {
+    if (!selectedCamera || selectedCamera.properties.streamUrl) return; // streams self-refresh
+    const ms = refreshIntervalMs(selectedCamera);
     refreshTimer.current = setInterval(() => {
       setImgCacheBust(Date.now());
       setLastRefresh(new Date());
       setImgLoaded(false);
-    }, 15000);
+    }, ms);
     return () => { if (refreshTimer.current) clearInterval(refreshTimer.current); };
-  }, []);
+  }, [selectedCamera?.properties.id]);
 
   useEffect(() => {
     setImgLoaded(false);
     setImgCacheBust(Date.now());
     setLiveWindyUrl(null);
     setHlsFailed(false); // reset on every camera change
+    setStaticFeedFailed(false); // reset on every camera change
     setImgLastLoaded(null); // reset image timestamp on camera change
     setLastImageHash(null); // reset hash on camera change
 
@@ -378,8 +648,8 @@ function App() {
           headers: { 'x-windy-api-key': apiKey }
         })
           .then(r => r.json())
-          .then(data => {
-            const images = data.images || {};
+          .then(json => {
+            const images = json.images || {};
             const liveUrl = (images.current && images.current.preview) || (images.daylight && images.daylight.preview);
             if (liveUrl) setLiveWindyUrl(liveUrl);
           })
@@ -402,8 +672,8 @@ function App() {
           headers: { 'x-windy-api-key': apiKey }
         })
           .then(r => r.json())
-          .then(data => {
-            const images = data.images || {};
+          .then(json => {
+            const images = json.images || {};
             const liveUrl = (images.current && images.current.preview) || (images.daylight && images.daylight.preview);
             if (liveUrl) setLiveWindyUrl(liveUrl);
           })
@@ -455,13 +725,18 @@ function App() {
   };
 
 
+  // Write the coordinate HUD directly to the DOM (bypasses React so cursor movement
+  // doesn't re-render the whole component).
+  const writeCoord = (lng: number, lat: number) => {
+    if (coordRef.current) coordRef.current.textContent = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+  };
+
   const onMapClick = (e: MapMouseEvent) => {
     const feature = e.features?.[0];
-    if (feature) {
-      const camId = feature.properties?.id;
-      const original = cameraMap.get(camId);
-      if (original) {
-        setSelectedCamera(original);
+    if (feature && data) {
+      const i = idToIdx.get(feature.properties?.id);
+      if (i !== undefined) {
+        setSelectedCamera(camAt(data, i));
         setHlsFailed(false);
       }
     }
@@ -469,45 +744,55 @@ function App() {
 
   const onMapMouseMove = (e: MapMouseEvent) => {
     const feature = e.features?.[0];
-    if (feature) {
-      const camId = feature.properties?.id;
-      const original = cameraMap.get(camId);
-      setHovered(original || null);
-      if (Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
-        setMouseCoords([e.lngLat.lng, e.lngLat.lat]);
-      }
-      e.target.getCanvas().style.cursor = 'crosshair';
-    } else {
-      setHovered(null);
-      if (e.lngLat && Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
-        setMouseCoords([e.lngLat.lng, e.lngLat.lat]);
-      }
-      e.target.getCanvas().style.cursor = '';
+    const idx = feature && data ? (idToIdx.get(feature.properties?.id) ?? -1) : -1;
+    // Only update hover state when the hovered camera changes.
+    if (idx !== hoveredIdxRef.current) {
+      hoveredIdxRef.current = idx;
+      setHovered(idx >= 0 && data ? camAt(data, idx) : null);
     }
+    if (e.lngLat && Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
+      writeCoord(e.lngLat.lng, e.lngLat.lat);
+    }
+    e.target.getCanvas().style.cursor = idx >= 0 ? 'crosshair' : '';
   };
 
+  // Partition the render set into live vs static once — the two deck layers and the HUD
+  // counts both read it, so we iterate filteredIndices a single time.
+  const { liveIdx, stillIdx } = useMemo(() => {
+    const live: number[] = [], still: number[] = [];
+    if (data) for (const i of filteredIndices) (data.stream[i] ? live : still).push(i);
+    return { liveIdx: live, stillIdx: still };
+  }, [data, filteredIndices]);
+
   const deckLayers = [
-    new ScatterplotLayer<CameraFeature>({
-      id: 'deck-points',
-      data: filteredCameras,
-      getPosition: d => d.geometry.coordinates,
-      getFillColor: d => {
-        const base = d.properties.streamUrl ? [0, 255, 136] : [0, 229, 255];
-        return [...base, nodeOpacity * 255];
-      },
-      getRadius: d => (hovered?.properties.id === d.properties.id ? 6000 : 3000),
-      radiusMinPixels: 0.4,
-      radiusMaxPixels: 4,
+    // Static feeds: dimmer/smaller cyan, drawn underneath. Constant color + layer-level
+    // opacity uniform, so neither the opacity slider nor hover rebuilds the point buffers.
+    new ScatterplotLayer<number>({
+      id: 'deck-still',
+      data: stillIdx,
+      getPosition: (i: number) => (data ? [data.lon[i], data.lat[i]] : [0, 0]),
+      getFillColor: [0, 229, 255],
+      getRadius: 3000,
+      radiusMinPixels: 0.7,
+      radiusMaxPixels: 5,
+      opacity: nodeOpacity * 0.85,
       pickable: true,
       autoHighlight: true,
-      highlightColor: [255, 255, 255, 255],
-      transitions: {
-        getRadius: 150
-      },
-      updateTriggers: {
-        getFillColor: [nodeOpacity],
-        getRadius: [hovered?.properties.id]
-      }
+      highlightColor: [255, 255, 255, 255]
+    }),
+    // Live video feeds: larger, brighter green, drawn on top so they pop out of the field.
+    new ScatterplotLayer<number>({
+      id: 'deck-live',
+      data: liveIdx,
+      getPosition: (i: number) => (data ? [data.lon[i], data.lat[i]] : [0, 0]),
+      getFillColor: [0, 255, 136],
+      getRadius: 4500,
+      radiusMinPixels: 1.3,
+      radiusMaxPixels: 8,
+      opacity: Math.min(1, nodeOpacity * 1.15),
+      pickable: true,
+      autoHighlight: true,
+      highlightColor: [255, 255, 255, 255]
     }),
     ...(selectedCamera ? [
       new ScatterplotLayer<CameraFeature>({
@@ -527,20 +812,19 @@ function App() {
     ] : [])
   ];
 
-  const counts = filteredCameras.reduce((acc, c) => {
-    if (c.properties.streamUrl) {
-      acc.live += 1;
-    } else {
-      acc.still += 1;
-    }
-    return acc;
-  }, { live: 0, still: 0 });
+  const counts = { live: liveIdx.length, still: stillIdx.length };
 
   const feedUrl = selectedCamera?.properties.feedUrl ?? '';
   const streamUrl = selectedCamera?.properties.streamUrl ?? '';
-  const feedWorks = selectedCamera ? isFeedWorking(feedUrl, streamUrl) : false;
   // hasStream is true only when a stream URL exists AND it hasn't failed CORS/Network checks
   const hasStream = !!(streamUrl) && !hlsFailed;
+  // Embeddable third-party player (e.g. YouTube live) — only ones whose host
+  // passed the framing probe are ever marked directEligible, see host_prober.py
+  const isIframe = selectedCamera?.properties.feedType === 'iframe';
+  // TxDOT snapshots need a JSON fetch+decode (see TxdotSnapshot); staticFeedFailed
+  // gates the whole panel once that's tried direct and via-proxy and both failed.
+  const isTxdotJson = selectedCamera?.properties.feedType === 'txdot-json';
+  const feedWorks = (selectedCamera ? isFeedWorking(selectedCamera) : false) && !staticFeedFailed;
 
   return (
     <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
@@ -564,8 +848,9 @@ function App() {
           onClick={onMapClick}
           onMouseMove={onMapMouseMove}
           onMouseLeave={() => {
+            hoveredIdxRef.current = -1;
             setHovered(null);
-            setMouseCoords(null);
+            if (coordRef.current) coordRef.current.textContent = '—';
           }}
           interactiveLayerIds={['camera-points']}
         >
@@ -574,20 +859,30 @@ function App() {
               id="camera-points"
               type="circle"
               paint={{
+                // Live feeds render larger and brighter than static ones (treatment B).
+                // The zoom interpolate must be the OUTERMOST expression with the
+                // live/static `case` inside each stop — MapLibre allows only one
+                // zoom-based interpolate per expression, so nesting two inside a
+                // `case` fails style validation and the layer never gets added.
                 'circle-radius': [
                   'interpolate', ['linear'], ['zoom'],
-                  2, 1.2,
-                  6, 2.5,
-                  10, 4.5,
-                  14, 6
+                  2, ['case', GLOBE_IS_LIVE, 1.8, 1.0],
+                  6, ['case', GLOBE_IS_LIVE, 3.4, 2.2],
+                  10, ['case', GLOBE_IS_LIVE, 6, 4],
+                  14, ['case', GLOBE_IS_LIVE, 8, 5.5]
                 ],
                 'circle-color': [
                   'case',
-                  ['all', ['has', 'streamUrl'], ['!=', ['get', 'streamUrl'], '']],
+                  GLOBE_IS_LIVE,
                   '#00ff88',
                   '#00e5ff'
                 ],
-                'circle-opacity': nodeOpacity,
+                'circle-opacity': [
+                  'case',
+                  GLOBE_IS_LIVE,
+                  Math.min(1, nodeOpacity * 1.15),
+                  nodeOpacity * 0.85
+                ],
                 'circle-pitch-alignment': 'map',
                 'circle-pitch-scale': 'map'
               }}
@@ -660,12 +955,19 @@ function App() {
           controller={true}
           layers={deckLayers}
           onHover={({ object, coordinate }) => {
-            setHovered(object || null);
-            if (coordinate) setMouseCoords(coordinate as [number, number]);
+            // object is a camera index into filteredIndices (0 is valid) or null.
+            const idx = (object as number | null) ?? -1;
+            // Only touch React state when the hovered camera actually changes.
+            if (idx !== hoveredIdxRef.current) {
+              hoveredIdxRef.current = idx;
+              setHovered(idx >= 0 && data ? camAt(data, idx) : null);
+            }
+            if (coordinate) writeCoord((coordinate as number[])[0], (coordinate as number[])[1]);
           }}
           onClick={({ object }) => {
-            if (object) {
-              setSelectedCamera(object);
+            const i = object as number | null;
+            if (i != null && data) {
+              setSelectedCamera(camAt(data, i));
               setHlsFailed(false);
             }
           }}
@@ -698,13 +1000,13 @@ function App() {
         style={{ background: 'radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.7) 100%)' }} />
 
       {/* ── MOUSE COORDINATES ── */}
-      {mouseCoords && (
+      {data && (
         <div className="absolute bottom-8 left-8 z-30 pointer-events-none">
           <div className="bg-[#05090C]/70 backdrop-blur-xl rounded-xl border border-white/10 px-6 py-4 flex flex-col gap-2 shadow-2xl">
             <div className="flex items-center gap-4">
               <Scan className="w-5 h-5 text-[#00e5ff]" />
-              <span className="text-[#00e5ff] text-base font-mono tracking-widest font-semibold">
-                {mouseCoords[1].toFixed(4)}, {mouseCoords[0].toFixed(4)}
+              <span ref={coordRef} className="text-[#00e5ff] text-base font-mono tracking-widest font-semibold">
+                —
               </span>
             </div>
             <div className="flex items-center gap-4 border-t border-white/5 pt-2">
@@ -754,7 +1056,7 @@ function App() {
                     <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                     <p className="text-gray-500 text-[10px] uppercase tracking-widest font-semibold mb-2">Total Nodes</p>
                     <p className="text-white font-mono text-2xl font-semibold">
-                      {loading ? '—' : cameras.length.toLocaleString()}
+                      {loading ? '—' : (data?.count ?? 0).toLocaleString()}
                     </p>
                   </div>
                   <div className="bg-[#0A1015]/40 rounded-2xl p-5 border border-[#00ff88]/20 relative overflow-hidden group">
@@ -849,7 +1151,7 @@ function App() {
                       {selectedCamera.properties.source ?? selectedCamera.properties.type}
                     </span>
                   )}
-                  {hasStream && (
+                  {(hasStream || isIframe) && (
                     <span className="text-[#00ff88] text-[9px] font-bold tracking-widest bg-[#00ff88]/10 px-1.5 py-0.5 rounded flex items-center border border-[#00ff88]/20">
                       <Video className="w-3 h-3 mr-1" /> LIVE
                     </span>
@@ -866,7 +1168,7 @@ function App() {
 
               {/* Controls */}
               <div className="flex items-center gap-2 flex-shrink-0">
-                {!hasStream && feedWorks && (
+                {!hasStream && !isIframe && feedWorks && (
                   <button onClick={manualRefresh} title="Refresh Feed"
                     className="w-10 h-10 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 flex items-center justify-center text-white transition-all group outline-none">
                     <RefreshCw className="w-4 h-4 group-hover:rotate-180 transition-transform duration-500" />
@@ -883,14 +1185,25 @@ function App() {
             <div className="flex-1 relative bg-black flex flex-col min-h-0 border-b border-white/10">
               {feedWorks ? (
                 <>
-                  {!hasStream && (
+                  {!hasStream && !isIframe && (
                     <div className="absolute bottom-4 left-4 z-10 bg-black/80 backdrop-blur-md rounded-lg px-3 py-1.5 flex items-center gap-2 border border-[#00e5ff]/30">
                       <div className="w-2 h-2 rounded-full bg-[#00e5ff] shadow-[0_0_8px_#00e5ff]" />
                       <span className="text-[#00e5ff] text-[10px] font-bold tracking-widest">STATIC</span>
                     </div>
                   )}
                   {hasStream ? (
-                    <HlsPlayer url={streamUrl || feedUrl} cacheBust={imgCacheBust} onFallback={() => setHlsFailed(true)} />
+                    <HlsPlayer url={streamUrl || feedUrl} cacheBust={imgCacheBust} onFallback={() => setHlsFailed(true)} proxyBase={syncServerUp === true ? PROXY_BASE : ''} />
+                  ) : isIframe ? (
+                    <iframe
+                      key={selectedCamera.properties.id}
+                      src={feedUrl}
+                      title={selectedCamera.properties.name}
+                      className="w-full h-full border-0"
+                      sandbox="allow-scripts allow-same-origin allow-presentation"
+                      allow="autoplay; encrypted-media; picture-in-picture"
+                    />
+                  ) : isTxdotJson ? (
+                    <TxdotSnapshot url={feedUrl} cacheBust={imgCacheBust} onFallback={() => setStaticFeedFailed(true)} proxyBase={syncServerUp === true ? PROXY_BASE : ''} />
                   ) : (
                     <>
                       {!imgLoaded && (
@@ -901,7 +1214,8 @@ function App() {
                       <img
                         key={`${selectedCamera.properties.id}-${imgCacheBust}`}
                         src={getLiveUrl(selectedCamera.properties.feedUrl)}
-                        crossOrigin={CORS_ENABLED_DOMAINS.some(d => selectedCamera.properties.feedUrl.includes(d)) ? "anonymous" : undefined}
+                        referrerPolicy={selectedCamera.properties.source?.startsWith('opencctv_') ? "no-referrer" : "strict-origin-when-cross-origin"}
+                        crossOrigin={selectedCamera.properties.source?.startsWith('opencctv_') ? undefined : (CORS_ENABLED_DOMAINS.some(d => selectedCamera.properties.feedUrl.includes(d)) ? "anonymous" : undefined)}
                         alt={selectedCamera.properties.name}
                         className="w-full h-full object-contain"
                         style={{ opacity: imgLoaded ? 1 : 0 }}
@@ -1008,9 +1322,9 @@ function App() {
               initial={{ opacity: 0, x: 20, scale: 0.95 }}
               animate={{ opacity: 1, x: 0, scale: 1 }}
               exit={{ opacity: 0, x: 20, scale: 0.95 }}
-              className="absolute bottom-0 right-20 bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-6 shadow-2xl min-w-[320px] flex flex-col z-50"
+              className="absolute bottom-0 right-20 bg-[#05090C]/90 backdrop-blur-2xl rounded-3xl border border-white/10 p-6 shadow-2xl min-w-[320px] max-h-[440px] flex flex-col z-50"
             >
-              <div className="flex items-center justify-between mb-8 flex-shrink-0">
+              <div className="flex items-center justify-between mb-6 flex-shrink-0">
                 <div>
                   <h3 className="text-white text-lg font-bold tracking-tight flex items-center gap-2">
                     <Settings className="w-5 h-5 text-[#00e5ff]" /> System Config
@@ -1025,6 +1339,8 @@ function App() {
                 </button>
               </div>
 
+              {/* Scrollable body — capped panel height so it never overlaps the top-right HUD */}
+              <div className="flex-1 min-h-0 overflow-y-auto pr-2 -mr-3 custom-scrollbar">
               <div className="space-y-6">
                 <div className="flex items-center justify-between gap-8">
                   <div>
@@ -1100,8 +1416,121 @@ function App() {
                 </div>
               </div>
 
+              {/* ── DATA SYNC (local dev server) ── */}
+              <div className="mt-6 pt-6 border-t border-white/5">
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-gray-200 text-sm font-semibold flex items-center gap-2">
+                    <RefreshCw className={`w-4 h-4 text-[#00e5ff] ${syncStatus === 'running' ? 'animate-spin' : ''}`} />
+                    Data Sync
+                  </p>
+                  <span className={`text-[9px] font-mono uppercase tracking-widest px-2 py-0.5 rounded ${
+                    syncServerUp === true ? 'text-[#00ff88] bg-[#00ff88]/10'
+                    : syncServerUp === false ? 'text-gray-500 bg-white/5'
+                    : 'text-gray-500'}`}>
+                    {syncServerUp === true ? 'Online' : syncServerUp === false ? 'Offline' : 'Checking…'}
+                  </span>
+                </div>
+                <p className="text-gray-500 text-[10px] uppercase tracking-wider mb-3">Refresh cameras from source</p>
+
+                {syncServerUp === false ? (
+                  <div className="text-[11px] text-gray-500 bg-white/5 border border-white/10 rounded-xl px-3 py-3 leading-relaxed">
+                    Local only. Start the control server, then reopen:
+                    <code className="block mt-1 text-[#00e5ff] font-mono text-[10px]">python scripts/server.py</code>
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-3 gap-2">
+                      {(['native', 'opencctv', 'both'] as const).map(t => (
+                        <button
+                          key={t}
+                          disabled={syncStatus === 'running' || syncServerUp !== true}
+                          onClick={() => runScrape(t)}
+                          className={`px-2 py-2 rounded-xl border text-[11px] font-semibold capitalize transition-all ${
+                            syncTarget === t
+                              ? 'bg-[#00e5ff]/20 border-[#00e5ff]/50 text-[#00e5ff]'
+                              : 'bg-white/5 border-white/10 text-gray-300 hover:border-white/25 disabled:opacity-40 disabled:hover:border-white/10'
+                          }`}
+                        >
+                          {t === 'opencctv' ? 'OpenCCTV' : t}
+                        </button>
+                      ))}
+                    </div>
+
+                    {syncStatus !== 'idle' && (
+                      <div className="mt-3">
+                        {/* Progress bar + ETA, driven by the scraper's [PROGRESS] lines. */}
+                        {syncProgress && (
+                          <div className="mb-2">
+                            <div className="flex items-center justify-between text-[10px] font-mono mb-1">
+                              <span className="text-[#00e5ff] uppercase tracking-wider">{syncProgress.plugin}</span>
+                              <span className="text-gray-400">
+                                {syncProgress.pct}%
+                                {syncStatus === 'running' && syncProgress.eta !== '—' && (
+                                  <span className="text-gray-500"> · eta {syncProgress.eta}</span>
+                                )}
+                              </span>
+                            </div>
+                            <div className="h-1.5 rounded-full bg-white/5 overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-[#00e5ff] to-[#00ff88] rounded-full transition-all duration-500 ease-out"
+                                style={{ width: `${syncProgress.pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        )}
+                        <div
+                          ref={syncLogRef}
+                          className="h-28 overflow-y-auto bg-black/40 border border-white/10 rounded-xl px-3 py-2 font-mono text-[10px] leading-relaxed text-gray-400 whitespace-pre-wrap custom-scrollbar"
+                        >
+                          {syncLog.length === 0
+                            ? <span className="text-gray-600">Starting {syncTarget}…</span>
+                            : syncLog.map((l, i) => <div key={i}>{l}</div>)}
+                        </div>
+                        <div className="flex items-center justify-between mt-2 gap-2">
+                          <span className={`text-[11px] font-mono truncate ${
+                            syncStatus === 'done' ? 'text-[#00ff88]'
+                            : syncStatus === 'error' ? 'text-red-400'
+                            : 'text-[#00e5ff]'}`}>
+                            {syncStatus === 'running' ? `Syncing ${syncTarget}…`
+                              : syncStatus === 'done' ? `Done · ${syncSummary}`
+                              : syncSummary}
+                          </span>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            {syncStatus === 'running' && (
+                              <button
+                                onClick={cancelScrape}
+                                className="px-3 py-1.5 rounded-lg bg-red-500/15 border border-red-500/40 text-red-400 text-[11px] font-semibold hover:bg-red-500/25 transition-all"
+                              >
+                                Cancel
+                              </button>
+                            )}
+                            {syncStatus === 'done' && (
+                              <button
+                                onClick={() => loadData(true)}
+                                className="px-3 py-1.5 rounded-lg bg-[#00ff88]/15 border border-[#00ff88]/40 text-[#00ff88] text-[11px] font-semibold hover:bg-[#00ff88]/25 transition-all whitespace-nowrap"
+                              >
+                                Reload map
+                              </button>
+                            )}
+                            {(syncStatus === 'done' || syncStatus === 'error') && (
+                              <button
+                                onClick={resetSync}
+                                className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/15 text-gray-300 text-[11px] font-semibold hover:border-white/30 transition-all"
+                              >
+                                Dismiss
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
               <div className="mt-6 pt-6 border-t border-white/5">
                 <p className="text-[10px] text-gray-600 font-mono text-center uppercase tracking-widest">Argus v1.4.2 · Secure</p>
+              </div>
               </div>
             </motion.div>
           )}
