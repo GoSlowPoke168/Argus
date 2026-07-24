@@ -571,12 +571,17 @@ function App() {
     return Object.entries(stats).sort((a, b) => b[1] - a[1]);
   }, [data]);
 
-  // Indices passing the active country filter — the render set for both map paths.
+  // Indices passing the active country filter AND actually displayable — the
+  // render set for both map paths. Mirrors isFeedWorking()'s condition
+  // (stream present, or the host passed a probe / has a real direct URL) so
+  // cameras that would only ever show "Feed Unavailable" are hidden entirely
+  // rather than cluttering the map as dead points.
   const filteredIndices = useMemo(() => {
     if (!data) return [] as number[];
     const idx: number[] = [];
     const active = new Set(filterCountries);
     for (let i = 0; i < data.count; i++) {
+      if (!data.stream[i] && data.de[i] !== 1) continue;
       if (active.size === 0 ||
           active.has(countryNameFor(data.ccDict[data.cc[i]], data.srcDict[data.src[i]]))) {
         idx.push(i);
@@ -1056,7 +1061,7 @@ function App() {
                     <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                     <p className="text-gray-500 text-[10px] uppercase tracking-widest font-semibold mb-2">Total Nodes</p>
                     <p className="text-white font-mono text-2xl font-semibold">
-                      {loading ? '—' : (data?.count ?? 0).toLocaleString()}
+                      {loading ? '—' : (counts.live + counts.still).toLocaleString()}
                     </p>
                   </div>
                   <div className="bg-[#0A1015]/40 rounded-2xl p-5 border border-[#00ff88]/20 relative overflow-hidden group">
