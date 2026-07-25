@@ -220,6 +220,10 @@ Examples:
     sel.add_argument("--resolve-txdot", action="store_true", dest="resolve_txdot",
                      help="Rewrite existing txdot:// placeholder cameras to the real "
                           "its.txdot.gov snapshot API URL in place, re-export, then exit")
+    sel.add_argument("--audit-eligible", action="store_true", dest="audit_eligible",
+                     help="Re-probe hosts of cameras already marked direct_eligible=1 "
+                          "(image/mjpeg/iframe/txdot-json); un-mark and hide any camera "
+                          "whose host no longer actually loads, re-export, then exit")
 
     # Optional exclusion
     parser.add_argument("--exclude", nargs="+", metavar="ALIAS",
@@ -449,7 +453,7 @@ def _probe_image_hosts_store(output_path, compact_path, summary_path):
     rows = conn.execute(
         "SELECT id, feed_url, origin_host FROM cameras WHERE "
         "(stream_url IS NULL OR stream_url='') AND direct_eligible=0 "
-        "AND feed_url LIKE 'http%' AND feed_type IN ('image','mjpeg')"
+        "AND feed_url LIKE 'http%' AND feed_type IN ('image','mjpeg','image/jpeg')"
     ).fetchall()
     if not rows:
         log("No gated image cameras found — nothing to probe.", "WARN")
@@ -569,6 +573,144 @@ def _resolve_txdot_store(output_path, compact_path, summary_path):
     log(f"Wrote compact → {compact_path}", "OK")
 
 
+def _audit_eligible_store(output_path, compact_path, summary_path):
+    """Re-probe hosts of cameras already marked direct_eligible=1 — catches hosts
+    that have since gone dead, started hotlink-blocking, or started blocking
+    framing, so the frontend's hide-non-working filter (filteredIndices) actually
+    excludes them instead of leaving a permanently-spinning/blank panel that the
+    map still lists as visible. Mirrors probe_image_host/probe_iframe_host from
+    the Phase 1/2 gating passes, just applied to the already-eligible side.
+
+    Scoped to `opencctv_*` sources only: those are the ones whose eligibility was
+    granted dynamically by host-probing in the first place. Native scrapers
+    (nyc_dot, drivebc, etc.) get eligibility from the long-vetted
+    `_LEGACY_WORKING_DOMAINS` allowlist in store.py — auditing them with a crude
+    few-sample-per-host probe is the wrong tool: a host can have thousands of
+    cameras with a handful of individually-retired IDs sprinkled in, and an
+    unlucky (or non-random) sample can make a mostly-healthy host look fully
+    dead. That happened here once already (nyc_dot briefly hidden in full,
+    restored). Per-camera dead links on native hosts are already handled at
+    view time by the frontend's own onError fallback — no need for bulk hiding.
+
+    Samples are drawn randomly (not `LIMIT N`, which is systematically biased
+    toward however the rows happen to be ordered — e.g. a whole batch of
+    camera IDs retired together and inserted contiguously), and any host that
+    fails is re-probed once more with a fresh random sample before being hidden,
+    to filter out transient network blips rather than trusting a single pass.
+
+    `source='windy'` cameras are excluded: the frontend re-fetches their image via
+    a JIT call to the Windy webcams API (App.tsx, VITE_WINDY_API_KEY) rather than
+    rendering the stored feed_url directly, so probing that stored URL doesn't
+    reflect what's actually displayed."""
+    import random
+    from scrapers.host_prober import probe_image_host, probe_iframe_host, probe_hosts
+    from scrapers.utils import HEADERS
+    import requests
+
+    conn = store.connect()
+    rows = conn.execute(
+        "SELECT id, feed_url, origin_host, feed_type FROM cameras WHERE "
+        "direct_eligible=1 AND (stream_url IS NULL OR stream_url='') "
+        "AND feed_url LIKE 'http%' AND source LIKE 'opencctv_%'"
+    ).fetchall()
+    if not rows:
+        log("No eligible non-stream cameras found — nothing to audit.", "WARN")
+        conn.close()
+        return
+
+    image_types = {"image", "image/jpeg", "mjpeg"}
+    by_host_image, by_host_iframe, by_host_txdot = {}, {}, {}
+    for r in rows:
+        ft = r["feed_type"] or ""
+        if ft == "iframe":
+            by_host_iframe.setdefault(r["origin_host"], []).append(r)
+        elif ft == "txdot-json":
+            by_host_txdot.setdefault(r["origin_host"], []).append(r)
+        elif ft in image_types:
+            by_host_image.setdefault(r["origin_host"], []).append(r)
+        # any other feed_type (e.g. m3u8 resolved separately) is left alone
+
+    total_hosts = len(by_host_image) + len(by_host_iframe) + len(by_host_txdot)
+    total_checked = sum(len(v) for v in by_host_image.values()) \
+        + sum(len(v) for v in by_host_iframe.values()) \
+        + sum(len(v) for v in by_host_txdot.values())
+    log(f"Auditing {total_hosts:,} hosts covering {total_checked:,} already-eligible "
+        f"opencctv cameras...")
+
+    def _sample(cams, n):
+        return random.sample(cams, n) if len(cams) > n else list(cams)
+
+    image_samples = {h: [r["feed_url"] for r in _sample(cams, 8)] for h, cams in by_host_image.items()}
+    iframe_samples = {h: random.choice(cams)["feed_url"] for h, cams in by_host_iframe.items()}
+
+    def probe_txdot_host(host, sample_urls):
+        passes = 0
+        for url in sample_urls:
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=10)
+                if resp.status_code == 200 and resp.json().get("snippet"):
+                    passes += 1
+            except Exception:
+                continue
+        return passes >= max(1, (len(sample_urls) + 1) // 2)
+
+    txdot_samples = {h: [r["feed_url"] for r in cams[:8]] for h, cams in by_host_txdot.items()}
+
+    verdicts = {}
+    verdicts.update(probe_hosts(image_samples, probe_image_host))
+    verdicts.update(probe_hosts(iframe_samples, probe_iframe_host))
+    verdicts.update(probe_hosts(txdot_samples, probe_txdot_host))
+
+    by_host_all = {**by_host_image, **by_host_iframe, **by_host_txdot}
+
+    # A host failing once could be a transient blip, not a dead host — and the
+    # cost of wrongly hiding a working host is much higher than the cost of
+    # leaving a dead one visible a bit longer. Re-probe failures once more with
+    # a fresh random sample; only hide on a second consecutive failure.
+    first_failures = [h for h in by_host_all if not verdicts.get(h)]
+    if first_failures:
+        log(f"{len(first_failures):,} host(s) failed their first probe — "
+            f"confirming with a second pass before hiding anything...")
+        recheck_image = {h: [r["feed_url"] for r in _sample(by_host_image[h], 8)]
+                          for h in first_failures if h in by_host_image}
+        recheck_iframe = {h: random.choice(by_host_iframe[h])["feed_url"]
+                           for h in first_failures if h in by_host_iframe}
+        recheck_txdot = {h: [r["feed_url"] for r in by_host_txdot[h][:8]]
+                          for h in first_failures if h in by_host_txdot}
+        confirm = {}
+        confirm.update(probe_hosts(recheck_image, probe_image_host))
+        confirm.update(probe_hosts(recheck_iframe, probe_iframe_host))
+        confirm.update(probe_hosts(recheck_txdot, probe_txdot_host))
+        verdicts.update(confirm)
+
+    hidden = 0
+    hidden_hosts = []
+    for host, cams in by_host_all.items():
+        if not verdicts.get(host):
+            conn.executemany("UPDATE cameras SET direct_eligible=0 WHERE id=?",
+                              [(c["id"],) for c in cams])
+            hidden += len(cams)
+            hidden_hosts.append((host, len(cams)))
+    conn.commit()
+
+    failed = len(hidden_hosts)
+    log(f"Hosts: {total_hosts - failed:,}/{total_hosts:,} still pass their probe.", "OK")
+    if hidden_hosts:
+        log(f"Hid {hidden:,} cameras across {failed:,} host(s) that no longer load "
+            f"(now excluded from the map):", "WARN")
+        for host, n in sorted(hidden_hosts, key=lambda x: -x[1])[:20]:
+            log(f"    {host:<40} {n:>6,} cameras", "WARN")
+    else:
+        log("No previously-eligible host has gone dead — nothing hidden.", "OK")
+
+    total = store.export_geojson(conn, output_path)
+    store.export_compact(conn, compact_path)
+    store.export_summary(conn, summary_path)
+    conn.close()
+    log(f"Re-exported {total:,} cameras → {output_path}", "OK")
+    log(f"Wrote compact → {compact_path}", "OK")
+
+
 def main():
     args = _parse_args()
 
@@ -614,6 +756,11 @@ def main():
     if args.resolve_txdot:
         _banner()
         _resolve_txdot_store(output_path, compact_path, summary_path)
+        return
+
+    if args.audit_eligible:
+        _banner()
+        _audit_eligible_store(output_path, compact_path, summary_path)
         return
 
     if args.export:

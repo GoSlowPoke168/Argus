@@ -308,11 +308,6 @@ function isFeedWorking(cam: CameraFeature): boolean {
 const GLOBE_IS_LIVE: ExpressionSpecification =
   ['all', ['has', 'streamUrl'], ['!=', ['get', 'streamUrl'], '']];
 
-function shouldRetryWithProxy(url: string): boolean {
-  // Caltrans cameras may need retry with proxy if direct load fails
-  return url.includes('cwwp2.dot.ca.gov');
-}
-
 function getStreamColor(cam: CameraFeature): [number, number, number, number] {
   if (cam.properties.streamUrl) {
     return [0, 255, 136, 255]; // Neon Green for Live Video
@@ -1227,20 +1222,6 @@ function App() {
                         onLoad={handleImageLoad}
                         onError={(e) => {
                           const img = e.target as HTMLImageElement;
-                          const url = img.src;
-
-                          // Retry with CORS proxy if applicable
-                          if (shouldRetryWithProxy(url) && !url.includes('cors-anywhere')) {
-                            const proxiedUrl = `https://cors-anywhere.herokuapp.com/${url.split('?')[0]}`;
-                            img.src = proxiedUrl;
-                            img.onload = () => {
-                              setImgLoaded(true);
-                              img.style.opacity = '1';
-                            };
-                            return;
-                          }
-
-                          // If all retries fail, show error fallback
                           img.style.display = 'none';
                           const fb = img.nextElementSibling as HTMLElement;
                           if (fb) fb.style.display = 'flex';
