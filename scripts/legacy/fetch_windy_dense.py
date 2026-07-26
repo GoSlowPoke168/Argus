@@ -167,7 +167,7 @@ def main():
     print("  Argus — Dense Region Recursive Scraper")
     print("═" * 60 + "\n")
 
-    input_path = "public/windy_massive.geojson"
+    input_path = "archive/windy_massive.geojson"  # moved out of public/, no longer served to the frontend
     if not os.path.exists(input_path):
         log(f"Could not find {input_path}!")
         return
