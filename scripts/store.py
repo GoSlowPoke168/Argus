@@ -20,6 +20,10 @@ from urllib.parse import urlparse
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cameras.db")
 
+# Cameras per detail chunk (see export_compact). Small enough that opening a camera
+# costs one ~100KB request, large enough to keep the file count in the hundreds.
+DETAIL_CHUNK = 1000
+
 # Feature property keys that get their own column. Everything else in a
 # feature's properties is preserved in props_extra (JSON).
 _COLUMN_PROPS = {
@@ -356,22 +360,30 @@ def export_geojson(conn: sqlite3.Connection, path: str) -> int:
 
 
 def export_compact(conn: sqlite3.Connection, path: str) -> int:
-    """Compact parallel-array payload the frontend loads instead of the geojson.
+    """Split parallel-array payload the frontend loads instead of the geojson.
 
     Parallel arrays (no repeated JSON keys) with dictionary-encoded source/country
-    keep this ~4-5x smaller than geojson and let deck.gl render from flat arrays
-    without materializing one object per camera. Everything the feed panel needs
-    is included, so there's no second detail request.
+    keep this far smaller than geojson and let deck.gl render from flat arrays
+    without materializing one object per camera. It is written as three tiers,
+    because ~80% of a single combined payload is per-camera strings that only
+    matter for the one camera the user opens:
+
+      cameras.core.json      `path`  — coordinates + small codes. Blocks first paint.
+      cameras.labels.json            — name/city, for the hover tooltip. Loads behind core.
+      cameras.detail/<n>.json        — id/feed/stream/route/updateRate, DETAIL_CHUNK
+                                       cameras per file, fetched when one is opened.
+
+    Returns the camera count.
     """
     rows = conn.execute(
         "SELECT id,name,city,country,feed_url,stream_url,source,lon,lat,"
         "direct_eligible,update_rate,feed_type,props_extra FROM cameras"
     ).fetchall()
 
-    lon, lat, de, ur = [], [], [], []
-    ids, names, feed, stream, city, route = [], [], [], [], [], []
-    src_idx, cc_idx, ft_idx = [], [], []
-    src_dict, cc_dict, ft_dict = {}, {}, {}
+    lon, lat, de, live, ur = [], [], [], [], []
+    ids, names, feed, stream, route = [], [], [], [], []
+    src_idx, cc_idx, ft_idx, city_idx = [], [], [], []
+    src_dict, cc_dict, ft_dict, city_dict = {}, {}, {}, {}
 
     def _di(d, val):
         val = val or ""
@@ -388,7 +400,10 @@ def export_compact(conn: sqlite3.Connection, path: str) -> int:
         names.append(r["name"] or "")
         feed.append(r["feed_url"] or "")
         stream.append(r["stream_url"] or "")
-        city.append(r["city"] or "")
+        # The map only needs to know a stream exists (live vs static styling); the
+        # URL itself rides along in the detail chunk.
+        live.append(1 if r["stream_url"] else 0)
+        city_idx.append(_di(city_dict, r["city"]))
         src_idx.append(_di(src_dict, r["source"]))
         cc_idx.append(_di(cc_dict, r["country"]))
         ft_idx.append(_di(ft_dict, r["feed_type"]))
@@ -401,18 +416,48 @@ def export_compact(conn: sqlite3.Connection, path: str) -> int:
                 pass
         route.append(rt)
 
-    payload = {
-        "count":     len(ids),
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "srcDict":   [k for k, _ in sorted(src_dict.items(), key=lambda x: x[1])],
-        "ccDict":    [k for k, _ in sorted(cc_dict.items(), key=lambda x: x[1])],
-        "ftDict":    [k for k, _ in sorted(ft_dict.items(), key=lambda x: x[1])],
-        "lon": lon, "lat": lat, "de": de, "ur": ur,
-        "id": ids, "name": names, "feed": feed, "stream": stream,
-        "city": city, "src": src_idx, "cc": cc_idx, "ft": ft_idx, "route": route,
-    }
-    _atomic_write_json(path, payload, separators=(",", ":"))
-    return len(ids)
+    count = len(ids)
+    generated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _keys(d):
+        return [k for k, _ in sorted(d.items(), key=lambda x: x[1])]
+
+    _atomic_write_json(path, {
+        "count":     count,
+        "generated": generated,
+        "chunk":     DETAIL_CHUNK,
+        "srcDict":   _keys(src_dict),
+        "ccDict":    _keys(cc_dict),
+        "ftDict":    _keys(ft_dict),
+        "lon": lon, "lat": lat, "de": de, "live": live,
+        "src": src_idx, "cc": cc_idx, "ft": ft_idx,
+    }, separators=(",", ":"))
+
+    directory = os.path.dirname(os.path.abspath(path))
+    _atomic_write_json(os.path.join(directory, "cameras.labels.json"), {
+        "count": count, "generated": generated,
+        "cityDict": _keys(city_dict),
+        "name": names, "city": city_idx,
+    }, separators=(",", ":"))
+
+    detail_dir = os.path.join(directory, "cameras.detail")
+    os.makedirs(detail_dir, exist_ok=True)
+    n_chunks = (count + DETAIL_CHUNK - 1) // DETAIL_CHUNK
+    for n in range(n_chunks):
+        lo, hi = n * DETAIL_CHUNK, min((n + 1) * DETAIL_CHUNK, count)
+        _atomic_write_json(os.path.join(detail_dir, f"{n}.json"), {
+            "from": lo,
+            "id": ids[lo:hi], "feed": feed[lo:hi], "stream": stream[lo:hi],
+            "route": route[lo:hi], "ur": ur[lo:hi],
+        }, separators=(",", ":"))
+    # Drop chunks left over from a larger previous export, or they'd be served
+    # alongside the new ones and hand the frontend retired cameras.
+    for stale in os.listdir(detail_dir):
+        name, ext = os.path.splitext(stale)
+        if ext == ".json" and name.isdigit() and int(name) >= n_chunks:
+            os.remove(os.path.join(detail_dir, stale))
+
+    return count
 
 
 def export_summary(conn: sqlite3.Connection, path: str) -> dict:

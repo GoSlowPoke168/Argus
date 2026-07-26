@@ -6,9 +6,9 @@ __pycache__/
 *.csv
 
 # Generated data artifacts (system-of-record is scripts/data/cameras.db, also gitignored).
-# cameras.geojson and cameras.min.json are tracked despite being generated —
-# geojson is slow to rebuild from scratch, and min.json is what the deployed
-# static site fetches at runtime.
+# cameras.geojson and the cameras.core/labels/detail payload are tracked despite
+# being generated — geojson is slow to rebuild from scratch, and the payload is
+# what the deployed static site fetches at runtime.
 scripts/data/
 public/cameras.pmtiles
 public/summary.json

@@ -719,7 +719,8 @@ def main():
     output_path = args.output or os.path.join(scripts_dir, "..", "public", "cameras.geojson")
     output_path = os.path.normpath(output_path)
     summary_path = os.path.join(os.path.dirname(output_path), "summary.json")
-    compact_path = os.path.join(os.path.dirname(output_path), "cameras.min.json")
+    # export_compact writes cameras.labels.json + cameras.detail/ alongside this one.
+    compact_path = os.path.join(os.path.dirname(output_path), "cameras.core.json")
 
     if args.list:
         _list_plugins()

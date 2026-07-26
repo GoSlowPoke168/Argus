@@ -27,7 +27,8 @@ Endpoints
                         and simply falls back to a static image.
 
 Every run uses --replace-source so stale/offline cameras from the sources being
-refreshed are dropped, and re-exports public/cameras.min.json when it finishes.
+refreshed are dropped, and re-exports the public/cameras.core+labels+detail
+payload when it finishes.
 """
 
 import ipaddress
