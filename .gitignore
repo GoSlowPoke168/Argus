@@ -4,3 +4,11 @@ dist/
 __pycache__/
 # *.geojson
 *.csv
+
+# Generated data artifacts (system-of-record is scripts/data/cameras.db, also gitignored).
+# cameras.geojson and the cameras.core/labels/detail payload are tracked despite
+# being generated — geojson is slow to rebuild from scratch, and the payload is
+# what the deployed static site fetches at runtime.
+scripts/data/
+public/cameras.pmtiles
+public/summary.json

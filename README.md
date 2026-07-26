@@ -1,319 +1,167 @@
 # ARGUS — Global Camera Intelligence
 
-Argus is a high-performance, tactical surveillance dashboard that aggregates and visualizes global open-data camera feeds. It provides real-time monitoring of **~95,000+ camera nodes** across highways, landmarks, and urban centers worldwide.
+Argus is an open-source, real-time interactive map of **229,000+ public traffic and CCTV cameras** from government and commercial sources worldwide — highway DOT cameras, city traffic cams, and public webcams, aggregated from open data APIs and rendered on a GPU-accelerated map (with a 3D globe view built in). It's a React, TypeScript, and Deck.GL/MapLibre dashboard for exploring live camera feeds, HLS video streams, and static snapshot imagery by country, region, or city, backed by a Python scraping pipeline that keeps the dataset current.
 
-## Demo
+It's two independent halves:
 
-![Argus Tactical UI](src/assets/DemoInterface1.png)
-
-![Argus Tactical UI](src/assets/DemoInterface2.png)
-
----
+- **Frontend** (`src/`) — a React + TypeScript dashboard. Reads a static JSON payload at runtime; it never talks to the scrapers directly.
+- **Data pipeline** (`scripts/`) — a Python CLI that scrapes camera metadata from ~10 government/commercial sources into a local SQLite store, then exports it to the JSON payload the frontend reads.
 
 ## Features
 
-- **Global Surveillance Scale** — Comprehensive visualization of ~95,000 nodes across 120+ international sectors.
-- **Geospatial Rendering** — GPU-accelerated tactical mapping utilizing Deck.GL and MapLibre for seamless navigation.
-- **Adaptive Stream Processing** — Intelligent feed management supporting low-latency HLS video and high-frequency imaging.
-- **Modular Ingestion Framework** — Extensible Python-based pipeline for multi-source data aggregation and standardization.
+- **2D tactical view** — thousands of camera dots over a dark MapLibre basemap, rendered with Deck.GL for performance at scale. Points below a zoom threshold are pixel-binned in a Web Worker so panning/zooming stays smooth with all 229k nodes loaded.
+- **3D globe view** — the same data on a rotating globe (`react-map-gl` + MapLibre's native globe projection), toggleable from the HUD.
+- **Live feed playback** — HLS streams via `hls.js` where available, falling back to a cache-busted static JPEG poll if the stream fails. A local dev-only proxy (`scripts/server.py`) resolves CORS and `ipcamlive://` streams that a browser can't reach directly.
+- **Filters, settings, and a country/sector browser** for narrowing down the camera set, plus a "jump to random camera" action.
+- **In-app data sync** — a Settings-panel button that (in development) triggers a scrape and re-export via the local control server, with live progress streamed into the UI.
 
----
+## Showcase
 
-## Project Structure
+![Argus Tactical UI](src/assets/argus_demo_1.png)
+![Argus Tactical UI](src/assets/argus_demo_2.png)
 
-```text
-Argus/
-├── public/
-│   └── cameras.geojson          # The main camera dataset (auto-generated)
-├── scripts/                     # Python Data Pipeline
-│   ├── scraper.py                # Unified CLI runner — the only script you need
-│   ├── scrapers/
-│   │   ├── utils.py             # Shared helpers (build_feature, log, HEADERS)
-│   │   ├── global/
-│   │   │   └── windy.py         # Windy Webcams (73k+ global)
-│   │   ├── usa/
-│   │   │   ├── road511.py       # Road511 multi-state (20 states)
-│   │   │   ├── california/
-│   │   │   │   └── caltrans.py  # Caltrans CCTV
-│   │   │   ├── new_york/
-│   │   │   │   └── nyc_dot.py   # NYC DOT
-│   │   │   └── iowa/
-│   │   │       └── iowa511.py   # Iowa DOT (ArcGIS)
-│   │   ├── canada/
-│   │   │   └── bc/
-│   │   │       └── drivebc.py   # DriveBC
-│   │   ├── asia/
-│   │   │   └── singapore/
-│   │   │       └── lta.py       # Singapore LTA
-│   │   ├── europe/
-│   │   │   └── uk/
-│   │   │       └── tfl_london.py# TfL London
-│   │   └── oceania/
-│   │       └── nz/
-│   │           └── nzta.py      # NZTA New Zealand
-│   └── legacy/                  # Retired scripts
-├── src/                         # React Frontend
-└── .env                         # API Keys (git-ignored)
-```
+## Quick Start
 
----
+**Prerequisites:** Node.js `^20.19.0 || >=22.12.0` (required by Vite 8), Python 3.9+.
 
-## Setup & Installation
-
-### 1. Frontend
+**Frontend**
 
 ```bash
 npm install
-npm run dev
+npm run dev       # Vite dev server, http://localhost:5173
 ```
 
-### 2. Python Pipeline
+Other frontend commands:
 
-**Requirements:** Python 3.9+ and `pip install requests`
+```bash
+npm run build      # tsc -b && vite build
+npm run lint        # eslint .
+npm run preview      # preview a production build locally
+```
 
-**API Keys** — create a `.env` file in the project root:
+There is no test suite configured (`npm test` does not exist).
+
+**Data pipeline** (from `scripts/`)
+
+```bash
+cd scripts
+pip install requests
+python scraper.py --list      # see all plugins
+python scraper.py --all       # run everything
+```
+
+Camera data lives in a SQLite store (`scripts/data/cameras.db`) and is exported to `public/cameras.geojson` plus the three-tier payload the frontend reads at runtime: `cameras.core.json` (map), `cameras.labels.json` (names, loaded behind it), and `cameras.detail/` (one chunk fetched per camera opened).
+
+**Local dev control server** (optional — powers the in-app "Data Sync" button)
+
+```bash
+python scripts/server.py    # listens on http://localhost:8787, run alongside `npm run dev`
+```
+
+## Configuration
+
+Only the `windy` plugin needs a key — every other source is keyless. Create `.env` in the project root:
+
 ```env
 WINDY_API_KEY=your_key_here
 VITE_WINDY_API_KEY=your_key_here
 ```
-> Get a free Windy key at [api.windy.com](https://api.windy.com/) — required only for the `windy` plugin. All other sources need no key.
 
----
+Get a free key at [api.windy.com](https://api.windy.com/). Both vars must hold the same value — `WINDY_API_KEY` is used by Python, `VITE_WINDY_API_KEY` is exposed to the browser by Vite.
 
-## Running the Data Pipeline
+## Project Structure
 
-All scraping is done through a single unified engine. Run from the **`scripts/`** directory:
-
-```bash
-cd scripts
+```
+Argus/
+├── src/
+│   ├── App.tsx           # Entire UI: HUD, settings, filters, feed panel, both map renderers
+│   ├── binWorker.ts       # Pixel-binning for the 2D map at low zoom (Web Worker)
+│   ├── main.tsx            # React entry point
+│   └── assets/               # Demo screenshots
+├── public/
+│   ├── cameras.geojson       # Full dataset, one feature per camera (also used by the pipeline)
+│   ├── cameras.core.json      # Positions/color/live flag — blocks first paint
+│   ├── cameras.labels.json     # Names — loads in behind core
+│   └── cameras.detail/          # Per-camera detail chunks, fetched on open
+├── scripts/
+│   ├── scraper.py             # CLI entry point — plugin registry, merge modes, maintenance passes
+│   ├── store.py                 # SQLite schema + export to the three-tier payload
+│   ├── server.py                  # Local-only control server behind the in-app "Data Sync" button
+│   ├── scrapers/                   # One plugin per source, organized by region:
+│   │   ├── usa/california/caltrans.py
+│   │   ├── usa/road511.py
+│   │   ├── canada/bc/drivebc.py
+│   │   ├── europe/uk/tfl_london.py
+│   │   ├── asia/singapore/lta.py
+│   │   ├── oceania/nz/nzta.py
+│   │   ├── global/windy.py
+│   │   ├── opencctv_bridge.py       # Strategic bridge: syncs 200k+ nodes from OpenCCTV
+│   │   ├── utils.py                  # build_feature() — normalizes every source to one schema
+│   │   └── ...resolvers (ipcamlive, txdot, host_prober)
+│   └── legacy/                        # Retired scripts, kept for reference only
+└── archive/                             # Orphaned data files, kept instead of deleted
 ```
 
-### See all available plugins
+## Dataset Breakdown
 
-```bash
-python scraper.py --list
-```
+Computed from the live store (`python scraper.py --stats`), 229,308 cameras total.
 
-### Common workflows
+**By continent**
 
-| Goal | Command |
-|---|---|
-| Full global run (everything) | `python scraper.py --all` |
-| Windy only (the big 73k run) | `python scraper.py --plugins windy` |
-| All fast sources, skip Windy | `python scraper.py --all --exclude windy` |
-| Specific plugins | `python scraper.py --plugins drivebc tfl_london nyc_dot` |
-| Remove stale cameras & refresh | `python scraper.py --all --replace-source` |
-| Nuke and rebuild from scratch | `python scraper.py --all --fresh` |
-| Custom output path | `python scraper.py --all --output ../public/cameras.geojson` |
-| Run plugins in parallel | `python scraper.py --all --exclude windy --parallel` |
+| Continent      | Cameras | Share |
+| -------------- | ------: | ----: |
+| North America  | 122,222 | 53.3% |
+| Europe         |  67,099 | 29.3% |
+| Asia           |  32,755 | 14.3% |
+| Oceania        |   4,772 |  2.1% |
+| South America  |   1,218 |  0.5% |
+| Africa         |   1,167 |  0.5% |
+| Antarctica     |      22 | <0.1% |
+| Unclassified\* |      39 | <0.1% |
 
-> **Default output:** `public/cameras.geojson` — the React app reads directly from this file.
+**By country** (every country with 1,000+ cameras — 24 of them, covering 94.5% of the dataset)
 
-### Road511 per-state targeting (`--states`)
+| Country                               |    Cameras |    Share |
+| ------------------------------------- | ---------: | -------: |
+| United States                         |    110,912 |    48.4% |
+| Japan                                 |     15,127 |     6.6% |
+| Canada                                |     10,884 |     4.7% |
+| United Kingdom                        |      7,829 |     3.4% |
+| Italy                                 |      7,071 |     3.1% |
+| Austria                               |      6,539 |     2.9% |
+| Taiwan                                |      6,305 |     2.7% |
+| Germany                               |      6,093 |     2.7% |
+| Spain                                 |      5,530 |     2.4% |
+| France                                |      5,209 |     2.3% |
+| Switzerland                           |      4,816 |     2.1% |
+| Finland                               |      3,398 |     1.5% |
+| Australia                             |      3,324 |     1.4% |
+| Norway                                |      3,093 |     1.3% |
+| Indonesia                             |      2,963 |     1.3% |
+| Czechia                               |      2,849 |     1.2% |
+| South Korea                           |      2,703 |     1.2% |
+| Sweden                                |      2,684 |     1.2% |
+| Vietnam                               |      2,107 |     0.9% |
+| Poland                                |      1,893 |     0.8% |
+| Slovenia                              |      1,548 |     0.7% |
+| New Zealand                           |      1,370 |     0.6% |
+| Russia                                |      1,365 |     0.6% |
+| Hong Kong                             |      1,021 |     0.4% |
+| **Other (149 countries/territories)** | **12,675** | **5.5%** |
 
-The `road511_usa` plugin supports a `--states` flag to target specific states. This bypasses all exclusion rules, so you can also pull states normally handled by dedicated plugins (CA, IA, NY) to check for gaps.
+<sub>\*A handful of rows (<0.1%) carry a malformed region tag from upstream sources rather than an ISO country code.</sub>
 
-| Goal | Command |
-|---|---|
-| Refresh one state | `python scraper.py --plugins road511_usa --states CO` |
-| Refresh multiple states | `python scraper.py --plugins road511_usa --states FL WA OR` |
-| Pull a normally-skipped state | `python scraper.py --plugins road511_usa --states CA NY` |
-| Re-scrape & replace stale data | `python scraper.py --plugins road511_usa --states TN --replace-source` |
+## Common Commands
 
-### Update Modes
-
-| Mode | What it does |
-|---|---|
-| *(default — upsert)* | Loads existing data, refreshes known cameras by ID, appends new ones. Safe to re-run anytime. |
-| `--replace-source` | Drops all cameras from the sources being run, then inserts fresh results. **Use this to remove stale/offline cameras.** Other sources are untouched. |
-| `--fresh` | Ignores existing file entirely. Writes only what was just fetched. Use to fully rebuild from scratch. |
-
-### Windy Full Global Run
-
-The Windy plugin runs in two phases automatically:
-
-1. **Phase 1** — Scans the globe with a 20°×20° grid (162 boxes)
-2. **Phase 2** — Any box returning ≥999 cameras is recursively subdivided into quadrants until fully drained
-
-```bash
-python scraper.py --plugins windy
-```
-
-> ⚠ Takes **10–30 minutes** depending on connection speed. HTTP 429 rate limits are handled automatically with a 10-second backoff.
-
----
-
-## Data Sources
-
-| Plugin Alias | Source | Region | Camera Count | Live HLS? | API Key |
-|:---|:---|:---|:---|:---|:---|
-| `windy` | [Windy Webcams](https://api.windy.com/) | 🌍 Global | ~73,700 | ❌ Image only | ✅ Required (Free) |
-| `road511_usa` | [Road511](https://api.road511.com/) | 🇺🇸 United States | ~15,000 | ✅ CO, TN, DE | ❌ None |
-| `caltrans` | [Caltrans CCTV](https://cwwp2.dot.ca.gov/) | 🇺🇸 California, USA | ~3,300 | ✅ Yes | ❌ None |
-| `nyc_dot` | [NYC TMC](https://webcams.nyctmc.org/) | 🇺🇸 New York City, USA | ~950 | ❌ Image only | ❌ None |
-| `iowa_dot` | [Iowa DOT](https://services.arcgis.com/8lRhdTsQyJpO52F1/ArcGIS/rest/services/Traffic_Cameras_View/FeatureServer/0) | 🇺🇸 Iowa, USA | ~850 | ✅ Yes | ❌ None |
-| `drivebc` | [DriveBC](https://www.drivebc.ca/) | 🇨🇦 British Columbia, CA | ~1,040 | ❌ Image only | ❌ None |
-| `tfl_london` | [Transport for London](https://api.tfl.gov.uk/) | 🇬🇧 London, UK | ~800 | ❌ Image only | ❌ None |
-| `singapore_lta` | [Singapore LTA](https://data.gov.sg/) | 🇸🇬 Singapore | ~90 | ❌ Image only | ❌ None |
-| `nzta` | [NZTA Journeys](https://www.journeys.nzta.govt.nz/) | 🇳🇿 New Zealand | ~varies | ❌ Image only | ❌ None |
-
-### Road511 State Coverage
-
-The `road511_usa` plugin covers the following states. States marked **Live** have confirmed CORS-compatible HLS streams; others are image-only.
-
-| State | Cameras | Feed Type |
-|---|---|---|
-| Florida | ~3,500 | Image (JPEG) |
-| Utah | ~1,500 | Image (JPEG) |
-| Washington | ~1,500 | Image (JPEG) |
-| Oregon | ~1,080 | Image (JPEG) |
-| Colorado | ~900 | **Live HLS** ✅ |
-| South Carolina | ~755 | Image (JPEG) |
-| Indiana | ~530 | Image (JPEG) |
-| Tennessee | ~668 | **Live HLS** ✅ |
-| Arizona | ~643 | Image (JPEG) |
-| Kansas | ~576 | Image (JPEG) |
-| Arkansas | ~545 | Image (JPEG) |
-| Ohio | ~500 | Image (JPEG) |
-| Kentucky | ~362 | Image (JPEG) |
-| Nebraska | ~350 | Image (JPEG) |
-| Delaware | ~345 | **Live HLS** ✅ |
-| Massachusetts | ~305 | Image (JPEG) |
-| Wyoming | ~220 | Image (JPEG) |
-| North Dakota | ~185 | Image (JPEG) |
-| South Dakota | ~43 | Image (JPEG) |
-| Montana | ~38 | Image (JPEG) |
-
-> States with no usable feed URLs (TX, NC, WI, GA, NV, PA, MI, ID, LA, MS, CT, ME, NH, WV, VT) are excluded automatically.
-
----
-
-## Adding a New Scraper Plugin
-
-The engine auto-loads any plugin registered in `PLUGIN_REGISTRY` inside `scraper.py`.
-
-### Step 1 — Create the scraper file
-
-Create a `.py` file under the appropriate region folder in `scripts/scrapers/`. It **must** export a `fetch(config)` function returning a list of GeoJSON Feature dicts.
-
-```python
-# scripts/scrapers/usa/my_state/my_source.py
-from scrapers.utils import log, build_feature, HEADERS
-import requests
-
-PLUGIN_META = {
-    "name":         "My New Source",
-    "key_required": False,
-    "description":  "Short description of what this scrapes",
-}
-
-def fetch(config: dict) -> list[dict]:
-    log("Fetching My New Source...")
-    features = []
-
-    try:
-        resp = requests.get("https://example.gov/api/cameras", headers=HEADERS,
-                            timeout=config.get("TIMEOUT", 15))
-        resp.raise_for_status()
-        cams = resp.json()
-    except Exception as e:
-        log(f"Fetch failed: {e}", "ERROR")
-        return []
-
-    for cam in cams:
-        try:
-            lat = float(cam["lat"])
-            lon = float(cam["lon"])
-            if lat == 0 and lon == 0:
-                continue
-
-            features.append(build_feature(
-                cam_id     = str(cam["id"]),
-                name       = cam.get("name", "Unknown Camera"),
-                lat        = lat,
-                lon        = lon,
-                feed_url   = cam.get("imageUrl", ""),   # static JPEG snapshot
-                stream_url = cam.get("streamUrl", ""),  # HLS .m3u8 (optional)
-                cam_type   = "traffic",
-                city       = cam.get("city", ""),
-                country    = "US",
-                source     = "my_new_source",
-            ))
-        except Exception:
-            continue
-
-    log(f"My New Source: {len(features)} cameras loaded", "OK")
-    return features
-```
-
-> **`build_feature` signature:**
-> ```python
-> build_feature(cam_id, name, lat, lon, feed_url, cam_type, city, country, source,
->               stream_url="",       # HLS .m3u8 URL — only set if CORS: * confirmed
->               player_url="",       # Link to a viewer page (optional)
->               feed_type="image/jpeg",
->               **kwargs)            # Any extra properties
-> ```
-> ⚠ Only set `stream_url` if you've confirmed the host returns `Access-Control-Allow-Origin: *`. Streams without CORS will fail silently in HLS.js. Test with: `curl -I <stream_url>` and check the `Access-Control-Allow-Origin` header.
-
-### Step 2 — Register it in `scraper.py`
-
-```python
-PLUGIN_REGISTRY = {
-    # ... existing entries ...
-
-    "my_new_source": {
-        "module":      "scrapers.usa.my_state.my_source",
-        "name":        "My New Source",
-        "key":         None,                      # or "MY_API_KEY_ENV_VAR"
-        "description": "Short description shown in --list",
-    },
-}
-```
-
-### Step 3 — If it needs an API key
-
-Add to `.env`:
-```env
-MY_API_KEY=your_key_here
-```
-
-Reference in `scraper.py`'s `CONFIG` dict:
-```python
-CONFIG = {
-    # ...
-    "MY_API_KEY": os.getenv("MY_API_KEY"),
-}
-```
-
-Read in your plugin via `config.get("MY_API_KEY")`.
-
-### Step 4 — Run it
-
-```bash
-cd scripts
-python scraper.py --plugins my_new_source
-```
-
----
-
-## Environment Configuration
-
-Create a `.env` file in the **project root** (`Argus/.env`):
-
-```env
-# Required for the Windy plugin (73k+ global cameras)
-WINDY_API_KEY=your_windy_key_here
-
-# Required for the React frontend — Windy JIT token fetching
-VITE_WINDY_API_KEY=your_windy_key_here
-```
-
-> Both keys can be the same value. `WINDY_API_KEY` is used by Python; `VITE_WINDY_API_KEY` is exposed to the browser by Vite (the `VITE_` prefix is required for Vite to pass it through to the frontend).
-
-> `.env` is git-ignored. Never commit API keys.
-
----
+| Goal                              | Command                                                     |
+| --------------------------------- | ----------------------------------------------------------- |
+| Camera counts by source           | `python scraper.py --stats`                                 |
+| Run specific plugins              | `python scraper.py --plugins drivebc tfl_london nyc_dot`    |
+| Run everything except Windy       | `python scraper.py --all --exclude windy`                   |
+| Target specific US states         | `python scraper.py --plugins road511_usa --states CO TN DE` |
+| Drop & refresh a source's cameras | `python scraper.py --all --replace-source`                  |
+| Rebuild from scratch              | `python scraper.py --all --fresh`                           |
+| Run plugins concurrently          | `python scraper.py --all --parallel`                        |
 
 ## TODO:
 - [ ] Add Satellite Camereas from https://eumetview.eumetsat.int/static-images/latestImages.html
@@ -323,4 +171,4 @@ VITE_WINDY_API_KEY=your_windy_key_here
 
 ## License
 
-This project is for educational and open-data visualization purposes only. All camera feeds are sourced from public, non-sensitive government or commercial APIs.
+[MIT](LICENSE). This project is for educational and open-data visualization purposes only — all camera feeds are sourced from public, non-sensitive government or commercial APIs.

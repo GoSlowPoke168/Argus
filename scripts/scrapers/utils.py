@@ -21,11 +21,58 @@ def log(msg: str, status: str = "INFO"):
     print(f"  {color}{icon} [{status}]{reset} {msg}")
 
 
+# Emitted on its own line by log_progress(); the Data Sync UI parses lines containing
+# this tag into a progress bar instead of showing them in the raw log.
+PROGRESS_TAG = "[PROGRESS]"
+
+
+def format_duration(seconds) -> str:
+    """Human ETA: '45s', '3m20s', '1h04m', or '—' when unknown."""
+    if seconds is None or seconds < 0:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def log_progress(plugin: str, done: int, total: int, start_time: float, approx: bool = False):
+    """Print a single progress line with an ASCII bar + ETA.
+
+    Format (stable — the frontend regex-parses the %, eta, and counts):
+      [PROGRESS] <plugin> [██████░░░░] 62% · 45,231/~73,000 · eta 1m18s
+
+    start_time must be a time.monotonic() captured when the work began.
+    approx=True marks the total as an estimate (prefixes it with '~').
+    """
+    total = max(int(total), 1)
+    frac = min(max(done / total, 0.0), 1.0)
+    pct = int(frac * 100)
+    elapsed = time.monotonic() - start_time
+    eta = (elapsed * (1 - frac) / frac) if frac > 0 else None
+
+    filled = int(round(frac * 20))
+    bar = "█" * filled + "░" * (20 - filled)
+    tot_label = f"~{total:,}" if approx else f"{total:,}"
+    print(f"  {PROGRESS_TAG} {plugin} [{bar}] {pct}% · {done:,}/{tot_label} · eta {format_duration(eta)}")
+
+
 def build_feature(cam_id: str, name: str, lat: float, lon: float,
                   feed_url: str, cam_type: str, city: str, country: str,
                   source: str, player_url: str = "", stream_url: str = "",
-                  feed_type: str = "image/jpeg", **kwargs) -> dict:
-    """Consistently build a GeoJSON Feature for a camera."""
+                  feed_type: str = "image/jpeg", direct_eligible: bool = None,
+                  update_rate: int = None, **kwargs) -> dict:
+    """Consistently build a GeoJSON Feature for a camera.
+
+    direct_eligible: set True/False to declare whether the feed embeds directly
+        (opencctv passes force_direct). Leave None for native sources — the store
+        infers it from the historical allowlist so behavior is unchanged.
+    update_rate: minimum refresh interval in ms, if the source publishes one.
+    """
     props = {
         "id":        f"{source}_{cam_id}",
         "name":      name,
@@ -38,6 +85,10 @@ def build_feature(cam_id: str, name: str, lat: float, lon: float,
         "feedType":  feed_type,
         "source":    source,
     }
+    if direct_eligible is not None:
+        props["directEligible"] = bool(direct_eligible)
+    if update_rate is not None:
+        props["updateRate"] = update_rate
     props.update(kwargs)
     return {
         "type":     "Feature",
