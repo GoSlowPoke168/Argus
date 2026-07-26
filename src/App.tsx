@@ -36,11 +36,9 @@ const scrollbarStyles = `
 
 const CROSSHAIR_COLOR = '#ff2d2d';
 
-// "Small" preset, matched to the live demo at neonbladeui.neuronrush.com/components/cursors/crosshair
-// (measured its rendered SVG rather than running its installer — see the crosshair
-// discussion). Only outerSize/innerSize shrink (44->28, 26->16, i.e. r 22->14, 13->8);
-// thickness, crosshair arm length/gap, speeds, and arc gap are unchanged from default.
-// Crosshair rings — counter-rotating arcs, transform-origin matches the SVG center (20,20).
+// "Small" preset (r 22->14, 13->8), matched from neonbladeui's live demo — only ring
+// size shrinks; thickness, arm length/gap, speed, and arc gap match the default.
+// Counter-rotating arcs, transform-origin at the SVG center (20,20).
 const crosshairStyles = `
   @keyframes crosshair-spin-cw { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   @keyframes crosshair-spin-ccw { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
@@ -58,8 +56,17 @@ function CrosshairCursor() {
       el.style.transform = `translate(${e.clientX - 20}px, ${e.clientY - 20}px)`;
       if (el.style.opacity !== '1') el.style.opacity = '1';
     };
+    // Hide on window exit, else it freezes at the edge and reads as a stuck real cursor.
+    const hide = () => {
+      const el = ref.current;
+      if (el) el.style.opacity = '0';
+    };
     window.addEventListener('mousemove', move);
-    return () => window.removeEventListener('mousemove', move);
+    document.documentElement.addEventListener('mouseleave', hide);
+    return () => {
+      window.removeEventListener('mousemove', move);
+      document.documentElement.removeEventListener('mouseleave', hide);
+    };
   }, []);
 
   return (
@@ -80,8 +87,7 @@ function CrosshairCursor() {
 
 function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cacheBust?: number; onFallback?: () => void; proxyBase?: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  // Escalation: play direct first; on a fatal error, retry once through the
-  // local CORS proxy (if available); only then fall back to a static image.
+  // Escalation: direct -> proxy (if available) -> static fallback.
   const [useProxy, setUseProxy] = useState(false);
   const canProxy = !!proxyBase;
 
@@ -92,8 +98,7 @@ function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cac
     if (!videoRef.current) return;
 
     const via = (u: string) => (useProxy && proxyBase ? `${proxyBase}${encodeURIComponent(u)}` : u);
-    // First failure escalates to the proxy; a failure while already proxied
-    // (or with no proxy available) is the real end → static fallback.
+    // First failure escalates to the proxy; failing again (or no proxy) means static.
     const escalate = () => {
       if (!useProxy && canProxy) {
         console.log('[Argus] Stream failed direct — retrying via local proxy.');
@@ -118,9 +123,8 @@ function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cac
 
     if (Hls.isSupported()) {
       hls = new Hls({ enableWorker: false });
-      // On the proxy retry, load the playlist *through* the proxy — the proxy
-      // rewrites every segment/variant URI to an absolute proxied URL, so all
-      // of hls.js's follow-up fetches are CORS-enabled too.
+      // On retry, the proxy rewrites every segment/variant URI, so hls.js's
+      // follow-up fetches through it are CORS-enabled too.
       hls.loadSource(via(url));
       hls.attachMedia(videoRef.current);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -135,8 +139,7 @@ function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cac
         }
       });
     } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS: it fetches segments itself, so the proxy can't rewrite
-      // them — direct-only, straight to fallback on error.
+      // Safari fetches segments itself, so the proxy can't help — direct-only.
       videoRef.current.src = url;
       videoRef.current.addEventListener('loadedmetadata', () => {
         videoRef.current?.play().catch(e => console.log('Autoplay prevented', e));
@@ -170,12 +173,8 @@ function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cac
   );
 }
 
-// TxDOT's snapshot API (its.txdot.gov) returns the image base64-embedded in a
-// JSON body, and sends no Access-Control-Allow-Origin header at all — a
-// browser fetch() is CORS-blocked everywhere, unlike an <img src> which
-// doesn't enforce CORS for basic display. Direct-first (in case that ever
-// changes), then the local proxy (dev-only, adds ACAO:*); with neither
-// working, gracefully fall back like any other unavailable feed.
+// TxDOT's snapshot API returns base64 JSON with no CORS header, so fetch() needs
+// the proxy. Tries direct first, then proxy, then falls back like any other feed.
 function TxdotSnapshot({ url, cacheBust, onFallback, proxyBase }: { url: string; cacheBust?: number; onFallback?: () => void; proxyBase?: string }) {
   const [src, setSrc] = useState<string | null>(null);
 
@@ -229,10 +228,8 @@ const PICK_RADIUS_PX = 8;
 // GPU cost is already low (~4ms vs 17ms at world zoom) and binning would barely thin.
 const THIN_MAX_ZOOM = 8;
 
-// Binned dots are drawn slightly larger. Collapsing a stack loses the antialiased spill
-// its members contributed to neighbouring pixels, which measured ~16% dimmer overall;
-// 1.2x restores total brightness to within 1% of drawing every point (measured against a
-// pixel diff of both renders) at no GPU cost, since it adds no instances.
+// Collapsing a stack loses the antialiased spill neighboring dots contributed (~16%
+// dimmer, measured); drawing binned dots at 1.2x radius restores brightness to within 1%.
 const BIN_RADIUS_BOOST = 1.2;
 
 // One representative camera per occupied screen pixel, plus how many collapsed into it.
@@ -269,8 +266,7 @@ interface CameraProperties {
   source?: string;
   directEligible?: boolean;
   updateRate?: number;
-  // Known from the core payload alone, so the hover tooltip can style a camera
-  // live/static before its detail chunk (which carries streamUrl) has arrived.
+  // Known from core alone, so hover can style live/static before the detail chunk arrives.
   live?: boolean;
 }
 
@@ -280,14 +276,10 @@ interface CameraFeature {
   properties: CameraProperties;
 }
 
-// Three-tier payload emitted by scripts/store.py:export_compact. Parallel arrays +
-// dictionary-encoded source/country/city let deck.gl render from flat arrays without
-// materializing one JS object per camera. The split exists because the per-camera
-// strings (feed URLs, ids) were ~80% of a combined payload but only ever matter for
-// the one camera that's open:
-//   core   — blocks first paint, everything needed to draw and filter the map.
-//   labels — name/city for the hover tooltip; streams in behind core.
-//   detail — id/feed/stream/route/updateRate, one chunk fetched per camera opened.
+// Three-tier payload from store.py:export_compact. Dict-encoded parallel arrays let
+// deck.gl render without one JS object per camera. Split because per-camera strings
+// (~80% of a combined payload) only matter for whichever camera is open:
+//   core (blocks first paint) / labels (name, streams in behind) / detail (per-camera, fetched on open)
 interface CoreData {
   count: number;
   chunk: number;
@@ -304,10 +296,8 @@ interface DetailChunk {
   id: string[]; feed: string[]; stream: string[]; route: string[]; ur: number[];
 }
 
-// Rebuild a single CameraFeature (the shape the whole UI expects) at index i — used
-// on hover/click/random, never for the full set. `labels` and `detail` are whatever
-// has loaded: hover passes no detail and gets a feature with no URLs, which is all
-// the tooltip reads.
+// Rebuilds one CameraFeature at index i (never the full set). `labels`/`detail` may be
+// null — hover passes no detail and gets no URLs, which is all the tooltip needs.
 function camAt(
   d: CoreData, i: number,
   labels: LabelData | null,
@@ -336,17 +326,14 @@ function camAt(
   };
 }
 
-// Sources with strict refresh ToS (satellite / weather-sat imagery updates
-// every ~10 min). Everything else honors its harvested updateRate under a
-// 60s global floor. Limits were uncertain, so this is conservative + editable.
 // Local dev-only control server (scripts/server.py). Absent on the deployed static site.
 const SYNC_SERVER = 'http://localhost:8787';
-// CORS pass-through proxy exposed by that same local server. Streams whose origin
-// sends no Access-Control-Allow-Origin can be played by routing hls.js's fetches
-// through here. Only used when the server is reachable (syncServerUp === true);
-// on the deployed static site it's never available and streams fall back to static.
+// CORS pass-through proxy on that same server, for streams whose origin sends no
+// Access-Control-Allow-Origin. Only used when reachable; falls back to static otherwise.
 const PROXY_BASE = `${SYNC_SERVER}/api/proxy?url=`;
 
+// Satellite/weather-sat sources refresh every ~10min (their ToS); everything else
+// honors its harvested updateRate under a 60s floor.
 const SATELLITE_SOURCES = ['goes-satellite', 'faa-weathercams', 'goes-satellite', 'satellite'];
 function refreshIntervalMs(cam: CameraFeature): number {
   const src = (cam.properties.source || '').toLowerCase();
@@ -373,28 +360,18 @@ const CORS_ENABLED_DOMAINS = [
   'nzta.govt.nz'
 ];
 
-// Whether a selected camera's feed can be displayed. Replaces the old hardcoded
-// domain allowlist: the scraper now stores a per-camera `directEligible` flag
-// (opencctv's force_direct, or the legacy allowlist for native sources), so this
-// scales to thousands of hosts. A live stream always counts as displayable.
+// Whether a camera's feed can display: a live stream, or the scraper's per-camera
+// `directEligible` flag (opencctv's force_direct / the legacy native-source allowlist).
 function isFeedWorking(cam: CameraFeature): boolean {
   if (cam.properties.streamUrl && cam.properties.streamUrl.trim()) return true;
   return !!cam.properties.directEligible;
 }
 
 
-// MapLibre filter expression: does this globe feature have a live stream?
-// Reused across the 3D layer's paint properties so live/static styling stays in sync.
-// Annotated (not inferred) so it stays a valid ExpressionSpecification tuple rather
-// than widening to string[][], which the paint prop types reject.
+// Reused across the 3D layer's paint properties. Explicitly typed so it stays a valid
+// ExpressionSpecification tuple rather than widening to string[][].
 const GLOBE_IS_LIVE: ExpressionSpecification = ['==', ['get', 'live'], 1];
 
-function getStreamColor(cam: CameraFeature): [number, number, number, number] {
-  if (cam.properties.streamUrl) {
-    return [0, 255, 136, 255]; // Neon Green for Live Video
-  }
-  return [0, 229, 255, 200]; // Cyan for Still Image
-}
 function formatLocation(cam: CameraFeature): string {
   const { city, country } = cam.properties;
   const countryName = COUNTRY_NAMES[country] || country;
@@ -402,9 +379,8 @@ function formatLocation(cam: CameraFeature): string {
   return `${city} · ${countryName}`;
 }
 
-// Parse a scraper "[PROGRESS] <plugin> [bar] NN% · a/b · eta X" line (emitted by
-// scripts/scrapers/utils.py:log_progress) into the fields the sync bar needs.
-// Returns null for any non-progress log line.
+// Parses a scraper "[PROGRESS] <plugin> [bar] NN% · a/b · eta X" line (emitted by
+// scrapers/utils.py:log_progress); null for any non-progress line.
 function parseProgress(line: string): { plugin: string; pct: number; eta: string } | null {
   if (!line || !line.includes('[PROGRESS]')) return null;
   const plugin = line.match(/\[PROGRESS\]\s+(\S+)/)?.[1] ?? '';
@@ -433,20 +409,17 @@ function App() {
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [imgLoaded, setImgLoaded] = useState(false);
   const [isHudMinimized, setIsHudMinimized] = useState(false);
-  // The live camera lives in a ref, not state. Feeding every pan frame through
-  // setState makes the map a controlled component: pointer event -> setState ->
-  // React commit -> redraw, which costs a frame of latency and reads as the map
-  // trailing the cursor. `initialView` only changes for programmatic jumps
-  // (mode switch, random camera) — deck adopts a changed initialViewState.
+  // Live camera lives in a ref, not state — feeding every pan frame through setState
+  // costs a frame of latency (pointer -> setState -> commit -> redraw). `initialView`
+  // only changes for programmatic jumps (mode switch, random camera).
   const [initialView, setInitialView] = useState(INITIAL_VIEW_STATE);
   const viewRef = useRef(INITIAL_VIEW_STATE);
   const zoomRef = useRef<HTMLSpanElement | null>(null);
   const globeRef = useRef<{ getMap?: () => { jumpTo: (o: object) => void } } | null>(null);
   const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
   const [hlsFailed, setHlsFailed] = useState(false);
-  // Set when a TxdotSnapshot fetch fails direct AND via the local proxy (or no
-  // proxy is available) — there's no separate static-image URL to fall back
-  // to for these, so this gates the whole panel to the "Feed Unavailable" card.
+  // Set when TxdotSnapshot fails both direct and proxy — no separate static-image
+  // URL to fall back to, so this gates the whole panel to "Feed Unavailable".
   const [staticFeedFailed, setStaticFeedFailed] = useState(false);
   const [imgLastLoaded, setImgLastLoaded] = useState<Date | null>(null);
   const [lastImageHash, setLastImageHash] = useState<string | null>(null);
@@ -486,10 +459,8 @@ function App() {
     });
   };
 
-  // Pan/zoom lands in a ref plus a direct DOM write, deliberately bypassing React.
-  // The one exception is crossing an integer zoom level, which invalidates the pixel
-  // bins (see binWorker) — rare enough that a re-render there costs nothing, while
-  // panning within a level still never touches state.
+  // Pan/zoom writes to a ref, bypassing React — except crossing an integer zoom level,
+  // which invalidates the pixel bins (see binWorker) and triggers one cheap re-render.
   const trackView = (v: typeof INITIAL_VIEW_STATE) => {
     viewRef.current = v;
     if (zoomRef.current) zoomRef.current.textContent = `${(v.zoom * 10).toFixed(1)}%`;
@@ -527,11 +498,9 @@ function App() {
     globeRef.current?.getMap?.()?.jumpTo({ center: [v.longitude, v.latitude], zoom: v.zoom });
   };
 
-  // Fetch (once) the detail chunk holding camera `i`. Everything that opens a camera
-  // goes through here, so the feed panel never renders against a half-loaded feature.
-  // Chunks are versioned by the core payload's timestamp: a sync can add cameras and
-  // shift every index, so an HTTP-cached chunk from before it would hand back the
-  // wrong camera's URLs. Between syncs the URL is stable and stays cacheable.
+  // Fetches (once, cached) the detail chunk holding camera `i`. Versioned by the core
+  // payload's timestamp — a sync shifts indices, so a stale cached chunk would return
+  // the wrong camera's URLs; stable and cacheable between syncs.
   const chunkFor = async (d: CoreData, i: number): Promise<DetailChunk | null> => {
     const n = Math.floor(i / d.chunk);
     const cached = chunksRef.current.get(n);
@@ -570,9 +539,8 @@ function App() {
     }
   };
 
-  // Load (or reload) the dataset. Core blocks the first paint; labels follow in the
-  // background (the hover tooltip degrades to location-only until they land) and
-  // detail chunks are pulled per camera. `bust` re-fetches past the cache after a sync.
+  // Loads (or reloads) the dataset. Core blocks first paint; labels follow in the
+  // background. `bust` re-fetches past the cache after a sync.
   const loadData = (bust = false) => {
     setLoading(true);
     const q = bust ? `?_t=${Date.now()}` : '';
@@ -580,8 +548,7 @@ function App() {
     fetch(`/cameras.core.json${q}`)
       .then(r => r.json())
       .then((d: CoreData) => {
-        // Pack coordinates into typed arrays: smaller footprint and a zero-copy upload
-        // path into deck.gl's position buffer.
+        // Typed arrays: smaller footprint and a zero-copy upload into deck.gl's buffer.
         d.lon = Float32Array.from(d.lon) as unknown as number[];
         d.lat = Float32Array.from(d.lat) as unknown as number[];
         setData(d);
@@ -594,8 +561,8 @@ function App() {
       .catch(() => setLoading(false));
   };
 
-  // Ref-guarded: StrictMode double-invokes mount effects in dev, and this payload is
-  // large enough that fetching it twice measurably slows every reload.
+  // Ref-guarded: StrictMode double-invokes mount effects in dev, and fetching this
+  // payload twice measurably slows every reload.
   useEffect(() => {
     if (didLoadRef.current) return;
     didLoadRef.current = true;
@@ -735,11 +702,8 @@ function App() {
     return Object.entries(stats).sort((a, b) => b[1] - a[1]);
   }, [data]);
 
-  // Indices passing the active country filter AND actually displayable — the
-  // render set for both map paths. Mirrors isFeedWorking()'s condition
-  // (stream present, or the host passed a probe / has a real direct URL) so
-  // cameras that would only ever show "Feed Unavailable" are hidden entirely
-  // rather than cluttering the map as dead points.
+  // Render set for both map paths: passes the country filter and is actually
+  // displayable (mirrors isFeedWorking()) — hides dead points instead of cluttering the map.
   const filteredIndices = useMemo(() => {
     if (!data) return [] as number[];
     const idx: number[] = [];
@@ -760,9 +724,8 @@ function App() {
     if (!data || !is3D) return { type: 'FeatureCollection', features: [] as any[] };
     return {
       type: 'FeatureCollection',
-      // Carry the array index, not the id — MapLibre serializes every property into
-      // its tiler worker, so a number here instead of an id + stream URL keeps ~10MB
-      // off that trip and removes the need for an id -> index lookup table entirely.
+      // Carry the array index, not id/streamUrl — MapLibre serializes every property
+      // to its tiler worker, saving ~10MB and removing the need for an id->index lookup.
       features: filteredIndices.map(i => ({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [data.lon[i], data.lat[i]] },
@@ -781,9 +744,8 @@ function App() {
     features: selectedCamera ? [selectedCamera] : []
   }), [selectedCamera]);
 
-  // Auto-refresh the selected camera's image at a rate that respects the
-  // source's limits: max(harvested updateRate, 60s floor), or 10 min for
-  // satellite/weather sources. Only the selected feed polls; nothing else does.
+  // Auto-refreshes the selected camera's image per refreshIntervalMs; only the
+  // selected feed polls.
   useEffect(() => {
     if (!selectedCamera || selectedCamera.properties.streamUrl) return; // streams self-refresh
     const ms = refreshIntervalMs(selectedCamera);
@@ -795,14 +757,15 @@ function App() {
     return () => { if (refreshTimer.current) clearInterval(refreshTimer.current); };
   }, [selectedCamera?.properties.id]);
 
+  // Resets all per-camera feed state when the selected camera changes.
   useEffect(() => {
     setImgLoaded(false);
     setImgCacheBust(Date.now());
     setLiveWindyUrl(null);
-    setHlsFailed(false); // reset on every camera change
-    setStaticFeedFailed(false); // reset on every camera change
-    setImgLastLoaded(null); // reset image timestamp on camera change
-    setLastImageHash(null); // reset hash on camera change
+    setHlsFailed(false);
+    setStaticFeedFailed(false);
+    setImgLastLoaded(null);
+    setLastImageHash(null);
 
     if (selectedCamera?.properties.source === 'windy') {
       const camId = selectedCamera.properties.id.replace('windy_', '');
@@ -847,11 +810,6 @@ function App() {
     }
   };
 
-  const getCorsProxiedUrl = (url: string): string => {
-    // For Caltrans, try direct first; if it fails, the error handler will retry with proxy
-    return url;
-  };
-
   const getLiveUrl = (url: string) => {
     if (selectedCamera?.properties.source === 'windy') {
       if (liveWindyUrl) return liveWindyUrl;
@@ -882,7 +840,7 @@ function App() {
           setImgLastLoaded(new Date());
         }
       }
-    } catch (err) {
+    } catch {
       // Fallback for non-CORS images: update timestamp on every successful load
       // because we can't inspect the pixels to know if it's the same.
       setImgLastLoaded(new Date());
@@ -890,18 +848,14 @@ function App() {
   };
 
 
-  // Write the coordinate HUD directly to the DOM (bypasses React so cursor movement
-  // doesn't re-render the whole component).
+  // Writes the coordinate HUD directly to the DOM, bypassing React.
   const writeCoord = (lng: number, lat: number) => {
     if (coordRef.current) coordRef.current.textContent = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
   };
 
-  // Zoomed out, a node renders barely a pixel wide, so a point-exact hit test almost
-  // never lands on an isolated one. When nothing is directly under the cursor, widen
-  // the search to a small box and take the closest node inside it. MapLibre's box
-  // query is coarse on the globe (it over-returns, and costs ~100ms), so this runs on
-  // click only — hover stays on the cheap exact query. The 2D Deck.GL path gets the
-  // same forgiveness for free from its `pickingRadius` prop.
+  // Widens an exact-miss to a small box query so near-1px isolated nodes are still
+  // clickable. Click-only — MapLibre's box query costs ~100ms, too slow for hover;
+  // the 2D path gets the same forgiveness for free via deck's `pickingRadius`.
   const pickNear = (e: MapMouseEvent) => {
     const exact = e.features?.[0];
     if (exact) return exact;
@@ -941,8 +895,7 @@ function App() {
     e.target.getCanvas().style.cursor = 'none';
   };
 
-  // Partition the render set into live vs static once — the two deck layers and the HUD
-  // counts both read it, so we iterate filteredIndices a single time.
+  // Partitioned once — the deck layers and HUD counts both read it.
   const { liveIdx, stillIdx } = useMemo(() => {
     const live: number[] = [], still: number[] = [];
     if (data) for (const i of filteredIndices) (data.live[i] ? live : still).push(i);
@@ -973,10 +926,8 @@ function App() {
     if (zoomLevel >= THIN_MAX_ZOOM) { setBins(null); return; }
     const reqId = ++binReqRef.current;
     binWorkerRef.current.postMessage({
-      // Bin one level finer than the current one: this set is reused across the whole
-      // [zoomLevel, zoomLevel+1) range, and binning at the low end would merge points
-      // that are still distinguishable near the top of it. Erring finer only costs
-      // instances, whereas erring coarser silently drops visible cameras.
+      // One level finer: this set covers [zoomLevel, zoomLevel+1), and binning at the
+      // low end would merge points still distinguishable near the top of that range.
       type: 'bin', reqId, zoom: zoomLevel + 1, dpr: window.devicePixelRatio || 1,
       still: stillIdx, live: liveIdx,
     });
@@ -985,16 +936,13 @@ function App() {
   const stillAlpha = nodeOpacity * 0.85;
   const liveAlpha = Math.min(1, nodeOpacity * 1.15);
 
-  // A binned dot stands in for `n` overlapping ones. Deck blends translucent dots with
-  // standard alpha compositing, so N stacked dots at alpha a read as 1-(1-a)^N — baking
-  // that into the survivor keeps dense regions exactly as bright as drawing all of them,
-  // while an isolated camera (n=1) still renders at the base opacity.
+  // N stacked dots at alpha a blend to 1-(1-a)^N; baking that into the one surviving
+  // dot keeps density visually intact (n=1 still renders at base opacity).
   const stackedAlpha = (a: number, n: number) => Math.round(255 * (1 - Math.pow(1 - a, n)));
 
   const deckLayers = [
-    // Static feeds: dimmer/smaller cyan, drawn underneath. Unbinned, this is a constant
-    // color + layer-level opacity uniform, so neither the opacity slider nor hover
-    // rebuilds the point buffers.
+    // Static feeds: dimmer/smaller cyan, drawn underneath. Unbinned, color/opacity are
+    // constants, so neither the opacity slider nor hover rebuilds the point buffers.
     new ScatterplotLayer<number>({
       id: 'deck-still',
       data: bins ? bins.still.idx : stillIdx,
@@ -1092,11 +1040,9 @@ function App() {
               id="camera-points"
               type="circle"
               paint={{
-                // Live feeds render larger and brighter than static ones (treatment B).
-                // The zoom interpolate must be the OUTERMOST expression with the
-                // live/static `case` inside each stop — MapLibre allows only one
-                // zoom-based interpolate per expression, so nesting two inside a
-                // `case` fails style validation and the layer never gets added.
+                // Zoom interpolate must be outermost with the live/static `case` nested
+                // inside each stop — MapLibre allows only one zoom interpolate per
+                // expression; the reverse nesting fails style validation silently.
                 'circle-radius': [
                   'interpolate', ['linear'], ['zoom'],
                   2, ['case', GLOBE_IS_LIVE, 1.8, 1.0],

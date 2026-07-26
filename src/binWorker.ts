@@ -1,19 +1,13 @@
 /**
- * Screen-pixel binning for the 2D map.
+ * Screen-pixel binning for the 2D map at low zoom.
  *
- * Zoomed out, ~229k cameras land on only ~26k distinct device pixels — up to 1620
- * of them stack on a single pixel. Drawing all of them is pure waste: the GPU pays
- * per instance (measured 17ms/frame at world zoom on integrated graphics) to produce
- * an image the screen can't resolve.
+ * Zoomed out, ~229k cameras land on only ~26k distinct pixels (up to 1620 per
+ * pixel), costing ~17ms/frame to draw an image the screen can't resolve. Keeps
+ * one representative camera per occupied pixel plus a count, so App.tsx can
+ * reproduce the same density via alpha accumulation (1-(1-a)^N).
  *
- * So we keep one representative camera per occupied pixel and record how many
- * collapsed into it. The density impression isn't lost — it's currently produced by
- * alpha accumulation of overlapping translucent dots, which App.tsx reproduces
- * exactly from `count` via 1-(1-a)^N. Isolated cameras (count 1) are always kept.
- *
- * Binning costs ~65-110ms for 229k points, which is why it lives in a worker and is
- * cached per integer zoom rather than run per frame. Panning never rebins (bins are
- * in world space); only a zoom-level or filter change does.
+ * Runs in a worker and is cached per integer zoom (binning costs ~65-110ms) —
+ * bins are in world space, so panning never triggers a rebin.
  */
 
 export interface BinGroup {
