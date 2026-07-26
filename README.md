@@ -23,7 +23,7 @@ python scraper.py --list      # see all plugins
 python scraper.py --all       # run everything
 ```
 
-Camera data lives in a SQLite store (`scripts/data/cameras.db`) and is exported to `public/cameras.geojson` / `public/cameras.min.json`, which the frontend reads at runtime.
+Camera data lives in a SQLite store (`scripts/data/cameras.db`) and is exported to `public/cameras.geojson` plus the three-tier payload the frontend reads at runtime: `cameras.core.json` (map), `cameras.labels.json` (names, loaded behind it), and `cameras.detail/` (one chunk fetched per camera opened).
 
 ## Configuration
 

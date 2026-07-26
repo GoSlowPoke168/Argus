@@ -34,6 +34,50 @@ const scrollbarStyles = `
   }
 `;
 
+const CROSSHAIR_COLOR = '#ff2d2d';
+
+// "Small" preset, matched to the live demo at neonbladeui.neuronrush.com/components/cursors/crosshair
+// (measured its rendered SVG rather than running its installer — see the crosshair
+// discussion). Only outerSize/innerSize shrink (44->28, 26->16, i.e. r 22->14, 13->8);
+// thickness, crosshair arm length/gap, speeds, and arc gap are unchanged from default.
+// Crosshair rings — counter-rotating arcs, transform-origin matches the SVG center (20,20).
+const crosshairStyles = `
+  @keyframes crosshair-spin-cw { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes crosshair-spin-ccw { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
+  .crosshair-ring-outer { transform-origin: 20px 20px; animation: crosshair-spin-cw 3s linear infinite; }
+  .crosshair-ring-inner { transform-origin: 20px 20px; animation: crosshair-spin-ccw 2s linear infinite; }
+`;
+
+function CrosshairCursor() {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      const el = ref.current;
+      if (!el) return;
+      el.style.transform = `translate(${e.clientX - 20}px, ${e.clientY - 20}px)`;
+      if (el.style.opacity !== '1') el.style.opacity = '1';
+    };
+    window.addEventListener('mousemove', move);
+    return () => window.removeEventListener('mousemove', move);
+  }, []);
+
+  return (
+    <div ref={ref} className="fixed top-0 left-0 z-[9999] pointer-events-none opacity-0" style={{ width: 40, height: 40, willChange: 'transform' }}>
+      <style>{crosshairStyles}</style>
+      {/* Dark drop-shadow first so the cursor also reads against bright camera-feed images. */}
+      <svg width="40" height="40" viewBox="0 0 40 40" style={{ overflow: 'visible', filter: `drop-shadow(0 0 1.5px rgba(0,0,0,0.95)) drop-shadow(0 0 4px ${CROSSHAIR_COLOR}) drop-shadow(0 0 9px ${CROSSHAIR_COLOR}99)` }}>
+        <circle className="crosshair-ring-outer" cx="20" cy="20" r="14" fill="none" stroke={CROSSHAIR_COLOR} strokeWidth="2" strokeLinecap="round" strokeDasharray="61.58 26.39" />
+        <circle className="crosshair-ring-inner" cx="20" cy="20" r="8" fill="none" stroke={CROSSHAIR_COLOR} strokeWidth="1.5" strokeLinecap="round" strokeDasharray="35.19 15.08" />
+        <line x1="20" y1="10" x2="20" y2="17" stroke={CROSSHAIR_COLOR} strokeWidth="1.5" />
+        <line x1="20" y1="23" x2="20" y2="30" stroke={CROSSHAIR_COLOR} strokeWidth="1.5" />
+        <line x1="10" y1="20" x2="17" y2="20" stroke={CROSSHAIR_COLOR} strokeWidth="1.5" />
+        <line x1="23" y1="20" x2="30" y2="20" stroke={CROSSHAIR_COLOR} strokeWidth="1.5" />
+      </svg>
+    </div>
+  );
+}
+
 function HlsPlayer({ url, cacheBust, onFallback, proxyBase }: { url: string; cacheBust?: number; onFallback?: () => void; proxyBase?: string }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   // Escalation: play direct first; on a fatal error, retry once through the
@@ -178,6 +222,23 @@ function TxdotSnapshot({ url, cacheBust, onFallback, proxyBase }: { url: string;
   return <img src={src} alt="" className="w-full h-full object-contain" />;
 }
 
+// How far from the cursor (in screen pixels) a node still counts as clicked/hovered.
+const PICK_RADIUS_PX = 8;
+
+// At or above this zoom, draw every point: most are clipped offscreen by then, so the
+// GPU cost is already low (~4ms vs 17ms at world zoom) and binning would barely thin.
+const THIN_MAX_ZOOM = 8;
+
+// Binned dots are drawn slightly larger. Collapsing a stack loses the antialiased spill
+// its members contributed to neighbouring pixels, which measured ~16% dimmer overall;
+// 1.2x restores total brightness to within 1% of drawing every point (measured against a
+// pixel diff of both renders) at no GPU cost, since it adds no instances.
+const BIN_RADIUS_BOOST = 1.2;
+
+// One representative camera per occupied screen pixel, plus how many collapsed into it.
+type BinGroup = { idx: number[]; count: number[] };
+type BinResult = { still: BinGroup; live: BinGroup };
+
 const INITIAL_VIEW_STATE = {
   longitude: -95,
   latitude: 38,
@@ -208,6 +269,9 @@ interface CameraProperties {
   source?: string;
   directEligible?: boolean;
   updateRate?: number;
+  // Known from the core payload alone, so the hover tooltip can style a camera
+  // live/static before its detail chunk (which carries streamUrl) has arrived.
+  live?: boolean;
 }
 
 interface CameraFeature {
@@ -216,40 +280,58 @@ interface CameraFeature {
   properties: CameraProperties;
 }
 
-// Compact parallel-array payload emitted by scripts/store.py:export_compact.
-// Parallel arrays + dictionary-encoded source/country keep the dataset small
-// (~6MB gzipped @200k) and let deck.gl render from flat arrays without
-// materializing one JS object per camera.
-interface CompactData {
+// Three-tier payload emitted by scripts/store.py:export_compact. Parallel arrays +
+// dictionary-encoded source/country/city let deck.gl render from flat arrays without
+// materializing one JS object per camera. The split exists because the per-camera
+// strings (feed URLs, ids) were ~80% of a combined payload but only ever matter for
+// the one camera that's open:
+//   core   — blocks first paint, everything needed to draw and filter the map.
+//   labels — name/city for the hover tooltip; streams in behind core.
+//   detail — id/feed/stream/route/updateRate, one chunk fetched per camera opened.
+interface CoreData {
   count: number;
+  chunk: number;
+  generated: string;
   srcDict: string[];
   ccDict: string[];
   ftDict?: string[];
-  lon: number[]; lat: number[]; de: number[]; ur: number[];
-  id: string[]; name: string[]; feed: string[]; stream: string[];
-  city: string[]; src: number[]; cc: number[]; ft?: number[]; route: string[];
+  lon: number[]; lat: number[]; de: number[]; live: number[];
+  src: number[]; cc: number[]; ft?: number[];
+}
+interface LabelData { cityDict: string[]; name: string[]; city: number[]; }
+interface DetailChunk {
+  from: number;
+  id: string[]; feed: string[]; stream: string[]; route: string[]; ur: number[];
 }
 
-// Rebuild a single CameraFeature (the shape the whole UI expects) from the
-// compact arrays at index i — used on hover/click/random, never for the full set.
-function camAt(d: CompactData, i: number): CameraFeature {
-  const stream = d.stream[i];
+// Rebuild a single CameraFeature (the shape the whole UI expects) at index i — used
+// on hover/click/random, never for the full set. `labels` and `detail` are whatever
+// has loaded: hover passes no detail and gets a feature with no URLs, which is all
+// the tooltip reads.
+function camAt(
+  d: CoreData, i: number,
+  labels: LabelData | null,
+  detail: DetailChunk | null,
+): CameraFeature {
+  const j = detail ? i - detail.from : -1;
+  const stream = j >= 0 ? detail!.stream[j] : '';
   return {
     type: 'Feature',
     geometry: { type: 'Point', coordinates: [d.lon[i], d.lat[i]] },
     properties: {
-      id: d.id[i],
-      name: d.name[i],
+      id: j >= 0 ? detail!.id[j] : '',
+      name: labels ? labels.name[i] : '',
       type: '',
-      city: d.city[i],
+      city: labels ? labels.cityDict[labels.city[i]] : '',
       country: d.ccDict[d.cc[i]],
-      feedUrl: d.feed[i],
+      feedUrl: j >= 0 ? detail!.feed[j] : '',
       streamUrl: stream || undefined,
       feedType: (d.ftDict && d.ft) ? (d.ftDict[d.ft[i]] || '') : '',
       source: d.srcDict[d.src[i]],
-      route: d.route[i] || undefined,
+      route: (j >= 0 ? detail!.route[j] : '') || undefined,
       directEligible: d.de[i] === 1,
-      updateRate: d.ur[i] || undefined,
+      updateRate: (j >= 0 ? detail!.ur[j] : 0) || undefined,
+      live: d.live[i] === 1,
     },
   };
 }
@@ -305,8 +387,7 @@ function isFeedWorking(cam: CameraFeature): boolean {
 // Reused across the 3D layer's paint properties so live/static styling stays in sync.
 // Annotated (not inferred) so it stays a valid ExpressionSpecification tuple rather
 // than widening to string[][], which the paint prop types reject.
-const GLOBE_IS_LIVE: ExpressionSpecification =
-  ['all', ['has', 'streamUrl'], ['!=', ['get', 'streamUrl'], '']];
+const GLOBE_IS_LIVE: ExpressionSpecification = ['==', ['get', 'live'], 1];
 
 function getStreamColor(cam: CameraFeature): [number, number, number, number] {
   if (cam.properties.streamUrl) {
@@ -334,12 +415,17 @@ function parseProgress(line: string): { plugin: string; pct: number; eta: string
 }
 
 function App() {
-  const [data, setData] = useState<CompactData | null>(null);
+  const [data, setData] = useState<CoreData | null>(null);
+  const [labels, setLabels] = useState<LabelData | null>(null);
+  // Detail chunks already fetched, keyed by chunk number. A ref, not state: it's a
+  // cache read inside async handlers, and filling it must not re-render the map.
+  const chunksRef = useRef(new window.Map<number, DetailChunk>());
   const [selectedCamera, setSelectedCamera] = useState<CameraFeature | null>(null);
   const [hovered, setHovered] = useState<CameraFeature | null>(null);
   // Last hovered camera index, tracked in a ref so per-pixel hover events only touch
   // React state when the hovered camera actually changes.
   const hoveredIdxRef = useRef(-1);
+  const didLoadRef = useRef(false);
   // Coordinate HUD is updated by writing textContent directly (no state -> no re-render).
   const coordRef = useRef<HTMLSpanElement | null>(null);
   const [loading, setLoading] = useState(true);
@@ -347,7 +433,15 @@ function App() {
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [imgLoaded, setImgLoaded] = useState(false);
   const [isHudMinimized, setIsHudMinimized] = useState(false);
-  const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
+  // The live camera lives in a ref, not state. Feeding every pan frame through
+  // setState makes the map a controlled component: pointer event -> setState ->
+  // React commit -> redraw, which costs a frame of latency and reads as the map
+  // trailing the cursor. `initialView` only changes for programmatic jumps
+  // (mode switch, random camera) — deck adopts a changed initialViewState.
+  const [initialView, setInitialView] = useState(INITIAL_VIEW_STATE);
+  const viewRef = useRef(INITIAL_VIEW_STATE);
+  const zoomRef = useRef<HTMLSpanElement | null>(null);
+  const globeRef = useRef<{ getMap?: () => { jumpTo: (o: object) => void } } | null>(null);
   const [liveWindyUrl, setLiveWindyUrl] = useState<string | null>(null);
   const [hlsFailed, setHlsFailed] = useState(false);
   // Set when a TxdotSnapshot fetch fails direct AND via the local proxy (or no
@@ -359,6 +453,12 @@ function App() {
   const [use24Hour, setUse24Hour] = useState(false);
   const [is3D, setIs3D] = useState(false);
   const [nodeOpacity, setNodeOpacity] = useState(0.8);
+  // Pixel-binned draw set for the 2D map, or null to draw every point (see binWorker).
+  const [bins, setBins] = useState<BinResult | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(Math.min(THIN_MAX_ZOOM, Math.floor(INITIAL_VIEW_STATE.zoom)));
+  const zoomLevelRef = useRef(zoomLevel);
+  const binWorkerRef = useRef<Worker | null>(null);
+  const binReqRef = useRef(0);
   const [showBorders, setShowBorders] = useState(false);
   const [filterCountries, setFilterCountries] = useState<string[]>([]);
   const [isFilterOpen, setIsFilterOpen] = useState(false);
@@ -386,52 +486,121 @@ function App() {
     });
   };
 
-  // Sanitize viewState on mode switch to prevent matrix crashes
-  useEffect(() => {
-    setViewState(prev => ({
-      ...prev,
-      latitude: Number.isFinite(prev.latitude) ? prev.latitude : 38,
-      longitude: Number.isFinite(prev.longitude) ? prev.longitude : -95,
-      zoom: Number.isFinite(prev.zoom) ? prev.zoom : 1.5,
-      pitch: Number.isFinite(prev.pitch) ? prev.pitch : 0,
-      bearing: Number.isFinite(prev.bearing) ? prev.bearing : 0,
-    }));
-  }, [is3D]);
-
-  const openRandomCamera = () => {
-    if (!data || filteredIndices.length === 0) return;
-    const i = filteredIndices[Math.floor(Math.random() * filteredIndices.length)];
-    const cam = camAt(data, i);
-    setSelectedCamera(cam);
-    setHlsFailed(false);
-
-    if (cam.geometry.coordinates[0] && cam.geometry.coordinates[1]) {
-      setViewState(prev => ({
-        ...prev,
-        longitude: cam.geometry.coordinates[0],
-        latitude: cam.geometry.coordinates[1],
-        zoom: Math.max(prev.zoom, 10)
-      }));
+  // Pan/zoom lands in a ref plus a direct DOM write, deliberately bypassing React.
+  // The one exception is crossing an integer zoom level, which invalidates the pixel
+  // bins (see binWorker) — rare enough that a re-render there costs nothing, while
+  // panning within a level still never touches state.
+  const trackView = (v: typeof INITIAL_VIEW_STATE) => {
+    viewRef.current = v;
+    if (zoomRef.current) zoomRef.current.textContent = `${(v.zoom * 10).toFixed(1)}%`;
+    const z = Math.min(THIN_MAX_ZOOM, Math.floor(v.zoom));
+    if (z !== zoomLevelRef.current) {
+      zoomLevelRef.current = z;
+      setZoomLevel(z);
     }
   };
 
-  // Load (or reload) the compact dataset. `bust` re-fetches past the cache after a sync.
+  // The HUD's zoom readout is written imperatively, so restate it after any render
+  // that may have remounted it (e.g. un-minimizing the HUD).
+  useEffect(() => { trackView(viewRef.current); });
+
+  // Hand the current camera to the other renderer on mode switch, sanitizing it
+  // first — a non-finite value crashes the projection matrix.
+  useEffect(() => {
+    const p = viewRef.current;
+    const v = {
+      latitude: Number.isFinite(p.latitude) ? p.latitude : 38,
+      longitude: Number.isFinite(p.longitude) ? p.longitude : -95,
+      zoom: Number.isFinite(p.zoom) ? p.zoom : 1.5,
+      pitch: Number.isFinite(p.pitch) ? p.pitch : 0,
+      bearing: Number.isFinite(p.bearing) ? p.bearing : 0,
+    };
+    trackView(v);
+    setInitialView(v);
+  }, [is3D]);
+
+  // Move the camera programmatically. Deck picks up a changed initialViewState;
+  // react-map-gl reads it only on mount, so the globe is moved through its map.
+  const jumpTo = (v: typeof INITIAL_VIEW_STATE) => {
+    trackView(v);
+    setInitialView(v);
+    globeRef.current?.getMap?.()?.jumpTo({ center: [v.longitude, v.latitude], zoom: v.zoom });
+  };
+
+  // Fetch (once) the detail chunk holding camera `i`. Everything that opens a camera
+  // goes through here, so the feed panel never renders against a half-loaded feature.
+  // Chunks are versioned by the core payload's timestamp: a sync can add cameras and
+  // shift every index, so an HTTP-cached chunk from before it would hand back the
+  // wrong camera's URLs. Between syncs the URL is stable and stays cacheable.
+  const chunkFor = async (d: CoreData, i: number): Promise<DetailChunk | null> => {
+    const n = Math.floor(i / d.chunk);
+    const cached = chunksRef.current.get(n);
+    if (cached) return cached;
+    try {
+      const c: DetailChunk = await fetch(
+        `/cameras.detail/${n}.json?v=${encodeURIComponent(d.generated)}`
+      ).then(r => r.json());
+      chunksRef.current.set(n, c);
+      return c;
+    } catch {
+      return null;
+    }
+  };
+
+  const selectCamera = async (i: number) => {
+    if (!data) return;
+    const cam = camAt(data, i, labels, await chunkFor(data, i));
+    setSelectedCamera(cam);
+    setHlsFailed(false);
+    return cam;
+  };
+
+  const openRandomCamera = async () => {
+    if (!data || filteredIndices.length === 0) return;
+    const i = filteredIndices[Math.floor(Math.random() * filteredIndices.length)];
+    const cam = await selectCamera(i);
+
+    if (cam && cam.geometry.coordinates[0] && cam.geometry.coordinates[1]) {
+      jumpTo({
+        ...viewRef.current,
+        longitude: cam.geometry.coordinates[0],
+        latitude: cam.geometry.coordinates[1],
+        zoom: Math.max(viewRef.current.zoom, 10)
+      });
+    }
+  };
+
+  // Load (or reload) the dataset. Core blocks the first paint; labels follow in the
+  // background (the hover tooltip degrades to location-only until they land) and
+  // detail chunks are pulled per camera. `bust` re-fetches past the cache after a sync.
   const loadData = (bust = false) => {
     setLoading(true);
-    fetch(bust ? `/cameras.min.json?_t=${Date.now()}` : '/cameras.min.json')
+    const q = bust ? `?_t=${Date.now()}` : '';
+    if (bust) chunksRef.current.clear();
+    fetch(`/cameras.core.json${q}`)
       .then(r => r.json())
-      .then((d: CompactData) => {
+      .then((d: CoreData) => {
         // Pack coordinates into typed arrays: smaller footprint and a zero-copy upload
         // path into deck.gl's position buffer.
         d.lon = Float32Array.from(d.lon) as unknown as number[];
         d.lat = Float32Array.from(d.lat) as unknown as number[];
         setData(d);
         setLoading(false);
+        fetch(`/cameras.labels.json${q}`)
+          .then(r => r.json())
+          .then(setLabels)
+          .catch(() => { /* names stay blank; the map is already usable */ });
       })
       .catch(() => setLoading(false));
   };
 
-  useEffect(() => { loadData(); }, []);
+  // Ref-guarded: StrictMode double-invokes mount effects in dev, and this payload is
+  // large enough that fetching it twice measurably slows every reload.
+  useEffect(() => {
+    if (didLoadRef.current) return;
+    didLoadRef.current = true;
+    loadData();
+  }, []);
 
   // Probe the local control server once on mount so the stream proxy is known to
   // be available while viewing a camera (Settings closed). Re-probed on open below.
@@ -576,7 +745,7 @@ function App() {
     const idx: number[] = [];
     const active = new Set(filterCountries);
     for (let i = 0; i < data.count; i++) {
-      if (!data.stream[i] && data.de[i] !== 1) continue;
+      if (!data.live[i] && data.de[i] !== 1) continue;
       if (active.size === 0 ||
           active.has(countryNameFor(data.ccDict[data.cc[i]], data.srcDict[data.src[i]]))) {
         idx.push(i);
@@ -591,20 +760,16 @@ function App() {
     if (!data || !is3D) return { type: 'FeatureCollection', features: [] as any[] };
     return {
       type: 'FeatureCollection',
+      // Carry the array index, not the id — MapLibre serializes every property into
+      // its tiler worker, so a number here instead of an id + stream URL keeps ~10MB
+      // off that trip and removes the need for an id -> index lookup table entirely.
       features: filteredIndices.map(i => ({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [data.lon[i], data.lat[i]] },
-        properties: { id: data.id[i], streamUrl: data.stream[i] },
+        properties: { i, live: data.live[i] },
       })),
     };
   }, [data, is3D, filteredIndices]);
-
-  // id -> array index, only needed to resolve clicks/hovers on the 3D globe layer.
-  const idToIdx = useMemo(() => {
-    const m = new window.Map<string, number>();
-    if (data && is3D) for (let i = 0; i < data.count; i++) m.set(data.id[i], i);
-    return m;
-  }, [data, is3D]);
 
   const hoveredGeoJson = useMemo(() => ({
     type: 'FeatureCollection',
@@ -731,51 +896,118 @@ function App() {
     if (coordRef.current) coordRef.current.textContent = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
   };
 
+  // Zoomed out, a node renders barely a pixel wide, so a point-exact hit test almost
+  // never lands on an isolated one. When nothing is directly under the cursor, widen
+  // the search to a small box and take the closest node inside it. MapLibre's box
+  // query is coarse on the globe (it over-returns, and costs ~100ms), so this runs on
+  // click only — hover stays on the cheap exact query. The 2D Deck.GL path gets the
+  // same forgiveness for free from its `pickingRadius` prop.
+  const pickNear = (e: MapMouseEvent) => {
+    const exact = e.features?.[0];
+    if (exact) return exact;
+    const { x, y } = e.point;
+    const near = e.target.queryRenderedFeatures(
+      [[x - PICK_RADIUS_PX, y - PICK_RADIUS_PX], [x + PICK_RADIUS_PX, y + PICK_RADIUS_PX]],
+      { layers: ['camera-points'] }
+    );
+    let best = undefined, bestDist = PICK_RADIUS_PX ** 2;
+    for (const f of near) {
+      const p = e.target.project((f.geometry as GeoJSON.Point).coordinates as [number, number]);
+      const dist = (p.x - x) ** 2 + (p.y - y) ** 2;
+      if (dist < bestDist) { bestDist = dist; best = f; }
+    }
+    return best;
+  };
+
   const onMapClick = (e: MapMouseEvent) => {
-    const feature = e.features?.[0];
+    const feature = pickNear(e);
     if (feature && data) {
-      const i = idToIdx.get(feature.properties?.id);
-      if (i !== undefined) {
-        setSelectedCamera(camAt(data, i));
-        setHlsFailed(false);
-      }
+      const i = feature.properties?.i;
+      if (typeof i === 'number') selectCamera(i);
     }
   };
 
   const onMapMouseMove = (e: MapMouseEvent) => {
     const feature = e.features?.[0];
-    const idx = feature && data ? (idToIdx.get(feature.properties?.id) ?? -1) : -1;
+    const idx = feature && data ? (feature.properties?.i ?? -1) : -1;
     // Only update hover state when the hovered camera changes.
     if (idx !== hoveredIdxRef.current) {
       hoveredIdxRef.current = idx;
-      setHovered(idx >= 0 && data ? camAt(data, idx) : null);
+      setHovered(idx >= 0 && data ? camAt(data, idx, labels, null) : null);
     }
     if (e.lngLat && Number.isFinite(e.lngLat.lng) && Number.isFinite(e.lngLat.lat)) {
       writeCoord(e.lngLat.lng, e.lngLat.lat);
     }
-    e.target.getCanvas().style.cursor = idx >= 0 ? 'crosshair' : '';
+    e.target.getCanvas().style.cursor = 'none';
   };
 
   // Partition the render set into live vs static once — the two deck layers and the HUD
   // counts both read it, so we iterate filteredIndices a single time.
   const { liveIdx, stillIdx } = useMemo(() => {
     const live: number[] = [], still: number[] = [];
-    if (data) for (const i of filteredIndices) (data.stream[i] ? live : still).push(i);
+    if (data) for (const i of filteredIndices) (data.live[i] ? live : still).push(i);
     return { liveIdx: live, stillIdx: still };
   }, [data, filteredIndices]);
 
+  // Spin up the binning worker once and hand it the coordinates when they land.
+  useEffect(() => {
+    const w = new Worker(new URL('./binWorker.ts', import.meta.url), { type: 'module' });
+    w.onmessage = (e: MessageEvent<{ reqId: number } & BinResult>) => {
+      // Ignore results for a zoom level or filter set we've already moved past.
+      if (e.data.reqId === binReqRef.current) setBins({ still: e.data.still, live: e.data.live });
+    };
+    binWorkerRef.current = w;
+    return () => { w.terminate(); binWorkerRef.current = null; };
+  }, []);
+
+  useEffect(() => {
+    if (data && binWorkerRef.current) {
+      binWorkerRef.current.postMessage({ type: 'init', lon: data.lon, lat: data.lat });
+    }
+  }, [data]);
+
+  // Rebin whenever the zoom level or the visible set changes. Never during a pan —
+  // bins are computed in world space, so panning reuses them untouched.
+  useEffect(() => {
+    if (!data || !binWorkerRef.current) return;
+    if (zoomLevel >= THIN_MAX_ZOOM) { setBins(null); return; }
+    const reqId = ++binReqRef.current;
+    binWorkerRef.current.postMessage({
+      // Bin one level finer than the current one: this set is reused across the whole
+      // [zoomLevel, zoomLevel+1) range, and binning at the low end would merge points
+      // that are still distinguishable near the top of it. Erring finer only costs
+      // instances, whereas erring coarser silently drops visible cameras.
+      type: 'bin', reqId, zoom: zoomLevel + 1, dpr: window.devicePixelRatio || 1,
+      still: stillIdx, live: liveIdx,
+    });
+  }, [data, zoomLevel, stillIdx, liveIdx]);
+
+  const stillAlpha = nodeOpacity * 0.85;
+  const liveAlpha = Math.min(1, nodeOpacity * 1.15);
+
+  // A binned dot stands in for `n` overlapping ones. Deck blends translucent dots with
+  // standard alpha compositing, so N stacked dots at alpha a read as 1-(1-a)^N — baking
+  // that into the survivor keeps dense regions exactly as bright as drawing all of them,
+  // while an isolated camera (n=1) still renders at the base opacity.
+  const stackedAlpha = (a: number, n: number) => Math.round(255 * (1 - Math.pow(1 - a, n)));
+
   const deckLayers = [
-    // Static feeds: dimmer/smaller cyan, drawn underneath. Constant color + layer-level
-    // opacity uniform, so neither the opacity slider nor hover rebuilds the point buffers.
+    // Static feeds: dimmer/smaller cyan, drawn underneath. Unbinned, this is a constant
+    // color + layer-level opacity uniform, so neither the opacity slider nor hover
+    // rebuilds the point buffers.
     new ScatterplotLayer<number>({
       id: 'deck-still',
-      data: stillIdx,
+      data: bins ? bins.still.idx : stillIdx,
       getPosition: (i: number) => (data ? [data.lon[i], data.lat[i]] : [0, 0]),
-      getFillColor: [0, 229, 255],
+      getFillColor: bins
+        ? (_: number, info: { index: number }) =>
+          [0, 229, 255, stackedAlpha(stillAlpha, bins.still.count[info.index])]
+        : [0, 229, 255],
       getRadius: 3000,
-      radiusMinPixels: 0.7,
+      radiusMinPixels: bins ? 0.7 * BIN_RADIUS_BOOST : 0.7,
       radiusMaxPixels: 5,
-      opacity: nodeOpacity * 0.85,
+      opacity: bins ? 1 : stillAlpha,
+      updateTriggers: { getFillColor: [bins, stillAlpha] },
       pickable: true,
       autoHighlight: true,
       highlightColor: [255, 255, 255, 255]
@@ -783,13 +1015,17 @@ function App() {
     // Live video feeds: larger, brighter green, drawn on top so they pop out of the field.
     new ScatterplotLayer<number>({
       id: 'deck-live',
-      data: liveIdx,
+      data: bins ? bins.live.idx : liveIdx,
       getPosition: (i: number) => (data ? [data.lon[i], data.lat[i]] : [0, 0]),
-      getFillColor: [0, 255, 136],
+      getFillColor: bins
+        ? (_: number, info: { index: number }) =>
+          [0, 255, 136, stackedAlpha(liveAlpha, bins.live.count[info.index])]
+        : [0, 255, 136],
       getRadius: 4500,
-      radiusMinPixels: 1.3,
+      radiusMinPixels: bins ? 1.3 * BIN_RADIUS_BOOST : 1.3,
       radiusMaxPixels: 8,
-      opacity: Math.min(1, nodeOpacity * 1.15),
+      opacity: bins ? 1 : liveAlpha,
+      updateTriggers: { getFillColor: [bins, liveAlpha] },
       pickable: true,
       autoHighlight: true,
       highlightColor: [255, 255, 255, 255]
@@ -827,20 +1063,17 @@ function App() {
   const feedWorks = (selectedCamera ? isFeedWorking(selectedCamera) : false) && !staticFeedFailed;
 
   return (
-    <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans">
+    <div className="w-full h-screen relative bg-[#111419] overflow-hidden font-sans cursor-none">
       <style>{scrollbarStyles}</style>
       {/* Map */}
       {is3D ? (
         <MapGL
           key="globe-map"
-          longitude={viewState.longitude}
-          latitude={viewState.latitude}
-          zoom={viewState.zoom}
-          pitch={viewState.pitch}
-          bearing={viewState.bearing}
+          ref={globeRef as never}
+          initialViewState={initialView}
           onMove={e => {
             if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
-              setViewState(e.viewState);
+              trackView(e.viewState);
             }
           }}
           mapStyle={mapStyle}
@@ -946,32 +1179,30 @@ function App() {
       ) : (
         <DeckGL
           key="tactical-deck"
-          viewState={viewState}
+          initialViewState={initialView}
           onViewStateChange={e => {
             if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
-              setViewState(e.viewState);
+              trackView(e.viewState);
             }
           }}
           controller={true}
           layers={deckLayers}
+          pickingRadius={PICK_RADIUS_PX}
           onHover={({ object, coordinate }) => {
             // object is a camera index into filteredIndices (0 is valid) or null.
             const idx = (object as number | null) ?? -1;
             // Only touch React state when the hovered camera actually changes.
             if (idx !== hoveredIdxRef.current) {
               hoveredIdxRef.current = idx;
-              setHovered(idx >= 0 && data ? camAt(data, idx) : null);
+              setHovered(idx >= 0 && data ? camAt(data, idx, labels, null) : null);
             }
             if (coordinate) writeCoord((coordinate as number[])[0], (coordinate as number[])[1]);
           }}
           onClick={({ object }) => {
             const i = object as number | null;
-            if (i != null && data) {
-              setSelectedCamera(camAt(data, i));
-              setHlsFailed(false);
-            }
+            if (i != null) selectCamera(i);
           }}
-          getCursor={({ isDragging }) => isDragging ? 'grabbing' : hovered ? 'crosshair' : 'grab'}
+          getCursor={() => 'none'}
         >
           <MapGL
             key="mercator-map"
@@ -1012,7 +1243,7 @@ function App() {
             <div className="flex items-center gap-4 border-t border-white/5 pt-2">
               <Activity className="w-4 h-4 text-gray-500" />
               <span className="text-gray-500 text-xs font-mono uppercase tracking-[0.2em]">
-                Zoom: <span className="text-white">{(viewState.zoom * 10).toFixed(1)}%</span>
+                Zoom: <span ref={zoomRef} className="text-white" />
               </span>
             </div>
           </div>
@@ -1114,7 +1345,7 @@ function App() {
                   {hovered.properties.name}
                 </p>
                 <div className="flex items-center gap-2">
-                  <div className={`w-1.5 h-1.5 rounded-full ${hovered.properties.streamUrl ? 'bg-[#00ff88]' : 'bg-[#00e5ff]'}`} />
+                  <div className={`w-1.5 h-1.5 rounded-full ${hovered.properties.live ? 'bg-[#00ff88]' : 'bg-[#00e5ff]'}`} />
                   <p className="text-gray-400 text-xs font-mono truncate">
                     {formatLocation(hovered)}
                   </p>
@@ -1646,6 +1877,8 @@ function App() {
           <Settings className={`w-6 h-6 ${isSettingsOpen ? 'animate-none' : 'group-hover:rotate-45 transition-transform'}`} />
         </button>
       </div>
+
+      <CrosshairCursor />
     </div>
   );
 }
