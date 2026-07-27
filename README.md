@@ -7,13 +7,15 @@ It's two independent halves:
 - **Frontend** (`src/`) — a React + TypeScript dashboard. Reads a static JSON payload at runtime; it never talks to the scrapers directly.
 - **Data pipeline** (`scripts/`) — a Python CLI that scrapes camera metadata from ~10 government/commercial sources into a local SQLite store, then exports it to the JSON payload the frontend reads.
 
+> **Note:** This project already comes with all of the cameras preloaded, so there is no need to scrape unless you want the most up-to-date cameras.
+
 ## Features
 
-- **2D tactical view** — thousands of camera dots over a dark MapLibre basemap, rendered with Deck.GL for performance at scale. Points below a zoom threshold are pixel-binned in a Web Worker so panning/zooming stays smooth with all 229k nodes loaded.
+- **2D map view** — thousands of camera dots over a dark MapLibre basemap, rendered with Deck.GL for performance at scale. 
 - **3D globe view** — the same data on a rotating globe (`react-map-gl` + MapLibre's native globe projection), toggleable from the HUD.
 - **Live feed playback** — HLS streams via `hls.js` where available, falling back to a cache-busted static JPEG poll if the stream fails. A local dev-only proxy (`scripts/server.py`) resolves CORS and `ipcamlive://` streams that a browser can't reach directly.
 - **Filters, settings, and a country/sector browser** for narrowing down the camera set, plus a "jump to random camera" action.
-- **In-app data sync** — a Settings-panel button that (in development) triggers a scrape and re-export via the local control server, with live progress streamed into the UI.
+- **In-app data sync** — a Settings-panel button that triggers a scrape and re-export via the local control server, with live progress streamed into the UI.
 
 ## Showcase
 
