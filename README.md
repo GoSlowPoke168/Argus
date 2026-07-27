@@ -1,6 +1,6 @@
 # ARGUS — Global Camera Intelligence
 
-Argus is an open-source, real-time interactive map of **229,000+ public traffic and CCTV cameras** from government and commercial sources worldwide — highway DOT cameras, city traffic cams, and public webcams, aggregated from open data APIs and rendered on a GPU-accelerated map (with a 3D globe view built in). It's a React, TypeScript, and Deck.GL/MapLibre dashboard for exploring live camera feeds, HLS video streams, and static snapshot imagery by country, region, or city, backed by a Python scraping pipeline that keeps the dataset current.
+Argus is an open-source, real-time interactive map of **229,000+ public traffic and CCTV cameras** from government and commercial sources worldwide — highway DOT cameras, city traffic cams, and public webcams, aggregated from open data APIs and rendered on a GPU-accelerated map (with a 3D globe view built in). Dashboard for exploring live camera feeds, HLS video streams, and static snapshot imagery by country, region, or city, backed by a Python scraping pipeline that keeps the dataset current.
 
 It's two independent halves:
 
@@ -165,7 +165,6 @@ Computed from the live store (`python scraper.py --stats`), 229,308 cameras tota
 
 ## TODO:
 - [ ] Add Satellite Camereas from https://eumetview.eumetsat.int/static-images/latestImages.html
-- [ ] Add Cameras from https://opencctv.org/api/hls-seg
 
 ---
 
