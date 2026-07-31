@@ -1,19 +1,21 @@
 # ARGUS — Global Camera Intelligence
 
-Argus is an open-source, real-time interactive map of **229,000+ public traffic and CCTV cameras** from government and commercial sources worldwide — highway DOT cameras, city traffic cams, and public webcams, aggregated from open data APIs and rendered on a GPU-accelerated map (with a 3D globe view built in). It's a React, TypeScript, and Deck.GL/MapLibre dashboard for exploring live camera feeds, HLS video streams, and static snapshot imagery by country, region, or city, backed by a Python scraping pipeline that keeps the dataset current.
+Argus is an open-source, real-time interactive map of **229,000+ public traffic and CCTV cameras** from government and commercial sources worldwide — highway DOT cameras, city traffic cams, and public webcams, aggregated from open data APIs and rendered on a GPU-accelerated map (with a 3D globe view built in). Dashboard for exploring live camera feeds, HLS video streams, and static snapshot imagery by country, region, or city, backed by a Python scraping pipeline that keeps the dataset current.
 
 It's two independent halves:
 
 - **Frontend** (`src/`) — a React + TypeScript dashboard. Reads a static JSON payload at runtime; it never talks to the scrapers directly.
 - **Data pipeline** (`scripts/`) — a Python CLI that scrapes camera metadata from ~10 government/commercial sources into a local SQLite store, then exports it to the JSON payload the frontend reads.
 
+> **Note:** This project already comes with all of the cameras preloaded, so there is no need to scrape unless you want the most up-to-date cameras.
+
 ## Features
 
-- **2D tactical view** — thousands of camera dots over a dark MapLibre basemap, rendered with Deck.GL for performance at scale. Points below a zoom threshold are pixel-binned in a Web Worker so panning/zooming stays smooth with all 229k nodes loaded.
+- **2D map view** — thousands of camera dots over a dark MapLibre basemap, rendered with Deck.GL for performance at scale. 
 - **3D globe view** — the same data on a rotating globe (`react-map-gl` + MapLibre's native globe projection), toggleable from the HUD.
 - **Live feed playback** — HLS streams via `hls.js` where available, falling back to a cache-busted static JPEG poll if the stream fails. A local dev-only proxy (`scripts/server.py`) resolves CORS and `ipcamlive://` streams that a browser can't reach directly.
 - **Filters, settings, and a country/sector browser** for narrowing down the camera set, plus a "jump to random camera" action.
-- **In-app data sync** — a Settings-panel button that (in development) triggers a scrape and re-export via the local control server, with live progress streamed into the UI.
+- **In-app data sync** — a Settings-panel button that triggers a scrape and re-export via the local control server, with live progress streamed into the UI.
 
 ## Showcase
 
@@ -162,6 +164,11 @@ Computed from the live store (`python scraper.py --stats`), 229,308 cameras tota
 | Drop & refresh a source's cameras | `python scraper.py --all --replace-source`                  |
 | Rebuild from scratch              | `python scraper.py --all --fresh`                           |
 | Run plugins concurrently          | `python scraper.py --all --parallel`                        |
+
+## TODO:
+- [ ] Add Satellite Camereas from https://eumetview.eumetsat.int/static-images/latestImages.html
+
+---
 
 ## License
 
