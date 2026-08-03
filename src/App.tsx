@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import DeckGL from '@deck.gl/react';
 import { ScatterplotLayer } from '@deck.gl/layers';
 import MapGL, { Source, Layer } from 'react-map-gl/maplibre';
-import type { MapMouseEvent, ExpressionSpecification } from 'maplibre-gl';
+import type { ExpressionSpecification } from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { Scan, Eye, Activity, X, MapPin, RefreshCw, Clock, Video, ChevronUp, ChevronDown, Settings, Shuffle, Filter, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -721,26 +721,26 @@ function App() {
   // GeoJSON source for the 3D globe path — built only when 3D is active so the
   // 2D default never materializes 100k+ features.
   const camerasGeoJson = useMemo(() => {
-    if (!data || !is3D) return { type: 'FeatureCollection', features: [] as any[] };
+    if (!data || !is3D) return { type: 'FeatureCollection' as const, features: [] as any[] };
     return {
-      type: 'FeatureCollection',
+      type: 'FeatureCollection' as const,
       // Carry the array index, not id/streamUrl — MapLibre serializes every property
       // to its tiler worker, saving ~10MB and removing the need for an id->index lookup.
       features: filteredIndices.map(i => ({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [data.lon[i], data.lat[i]] },
+        type: 'Feature' as const,
+        geometry: { type: 'Point' as const, coordinates: [data.lon[i], data.lat[i]] },
         properties: { i, live: data.live[i] },
       })),
     };
   }, [data, is3D, filteredIndices]);
 
   const hoveredGeoJson = useMemo(() => ({
-    type: 'FeatureCollection',
+    type: 'FeatureCollection' as const,
     features: hovered ? [hovered] : []
   }), [hovered]);
 
   const selectedGeoJson = useMemo(() => ({
-    type: 'FeatureCollection',
+    type: 'FeatureCollection' as const,
     features: selectedCamera ? [selectedCamera] : []
   }), [selectedCamera]);
 
@@ -856,7 +856,7 @@ function App() {
   // Widens an exact-miss to a small box query so near-1px isolated nodes are still
   // clickable. Click-only — MapLibre's box query costs ~100ms, too slow for hover;
   // the 2D path gets the same forgiveness for free via deck's `pickingRadius`.
-  const pickNear = (e: MapMouseEvent) => {
+  const pickNear = (e: any) => {
     const exact = e.features?.[0];
     if (exact) return exact;
     const { x, y } = e.point;
@@ -873,7 +873,7 @@ function App() {
     return best;
   };
 
-  const onMapClick = (e: MapMouseEvent) => {
+  const onMapClick = (e: any) => {
     const feature = pickNear(e);
     if (feature && data) {
       const i = feature.properties?.i;
@@ -881,7 +881,7 @@ function App() {
     }
   };
 
-  const onMapMouseMove = (e: MapMouseEvent) => {
+  const onMapMouseMove = (e: any) => {
     const feature = e.features?.[0];
     const idx = feature && data ? (feature.properties?.i ?? -1) : -1;
     // Only update hover state when the hovered camera changes.
@@ -1020,8 +1020,9 @@ function App() {
           ref={globeRef as never}
           initialViewState={initialView}
           onMove={e => {
-            if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
-              trackView(e.viewState);
+            const vs = e.viewState as any;
+            if (vs && Number.isFinite(vs.latitude) && Number.isFinite(vs.longitude)) {
+              trackView(vs);
             }
           }}
           mapStyle={mapStyle}
@@ -1127,8 +1128,9 @@ function App() {
           key="tactical-deck"
           initialViewState={initialView}
           onViewStateChange={e => {
-            if (e.viewState && Number.isFinite(e.viewState.latitude) && Number.isFinite(e.viewState.longitude)) {
-              trackView(e.viewState);
+            const vs = e.viewState as any;
+            if (vs && Number.isFinite(vs.latitude) && Number.isFinite(vs.longitude)) {
+              trackView(vs);
             }
           }}
           controller={true}
